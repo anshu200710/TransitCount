@@ -33,7 +33,7 @@ import csv, os, argparse
 # ═══════════════════════════════════════════════════════
 #  CONFIGURATION  — edit these to tune for your scene
 # ═══════════════════════════════════════════════════════
-LINE_RATIO     = 0.50    # Trigger line at 50% frame width
+LINE_RATIO     = 0.45    # Trigger line at 45% frame width
 DEAD_ZONE_PX   = 30      # ±30 px either side of line = 60 px total buffer zone
 DEBOUNCE_N     = 3       # Frames needed on same side to commit to that side
 CONF_THRESH    = 0.12    # Low — catches partial bodies / shoulders only
@@ -43,10 +43,8 @@ GHOST_TIMEOUT  = 150     # Purge ID state after this many frames of absence
 FLASH_FRAMES   = 20      # How long the cyan count-flash lasts
 EMA_ALPHA      = 0.40    # Centroid smoothing (0=frozen, 1=raw)
 
-# ByteTrack — tuned for dense crowds
-BT_ACTIVATION  = 0.18    # Min confidence to start tracking
-BT_MATCH       = 0.88    # IoU match threshold (lenient for occlusion)
-BT_BUFFER      = 150     # Lost track buffer: 5 s @ 30 fps
+# BoT-SORT tracker config (see botsort.yaml for full settings)
+TRACKER_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botsort.yaml")
 
 # Colours (BGR)
 COL_LINE      = (0,  0,   220)   # red trigger line
@@ -113,6 +111,7 @@ class TrackState:
     last_seen:   int  = 0
     side_frames: int  = 0        # consecutive frames on current confirmed side
     prev_side:   str  = ""       # last confirmed non-ZONE side
+    debounce_side: str = ""      # which side we are accumulating debounce for
 
 
 # ═══════════════════════════════════════════════════════
@@ -120,17 +119,11 @@ class TrackState:
 # ═══════════════════════════════════════════════════════
 class BusCounter:
 
-    def __init__(self, video_path: str, model_path: str = "yolov8n.pt",
+    def __init__(self, video_path: str, model_path: str = "yolov8s.pt",
                  output_path: str = "result_v3.mp4"):
         self.video_path  = video_path
         self.output_path = output_path
         self.model       = YOLO(model_path)
-        self.tracker     = sv.ByteTrack(
-            track_activation_threshold = BT_ACTIVATION,
-            lost_track_buffer          = BT_BUFFER,
-            minimum_matching_threshold = BT_MATCH,
-            minimum_consecutive_frames = 2,
-        )
         self.states: dict[int, TrackState] = {}
         self.in_count  = 0
         self.out_count = 0
@@ -198,48 +191,66 @@ class BusCounter:
         if st.zone_state == "SKIP":
             return None
 
+        # ── Cooldown after count — freeze state transitions ──────────────
+        if st.flash > 0:
+            return None
+
         # ── Side classification ───────────────────────────────────────────
         current_side = self._get_side(st.cx, line_x)
 
-        # ── State machine transitions ─────────────────────────────────────
+        # ── State machine transitions (with debounce) ─────────────────────
         event = None
 
         if current_side == "ZONE":
+            # Entering dead zone — transition immediately, reset debounce
             if st.zone_state in ("OUTSIDE", "INSIDE"):
                 st.zone_state = "ZONE"
-            # else: already ZONE, stay
+            st.side_frames   = 0
+            st.debounce_side = ""
+            # In zone — no count possible, wait for exit
 
-        elif current_side == "L":
-            if st.zone_state == "ZONE" and st.prev_side == "R":
-                # Confirmed crossing: INSIDE → ZONE → OUTSIDE  =  EXIT
-                if st.counted != "OUT":
-                    self.out_count += 1
-                    st.counted     = "OUT"
-                    st.flash       = FLASH_FRAMES
-                    event          = "OUT"
-                    self.events.append({
-                        "frame": frame_no, "id": tid, "event": "OUT",
-                        "in": self.in_count, "out": self.out_count
-                    })
-                    print(f"[{frame_no:05d}] ID {tid:3d} LEFT   | IN={self.in_count} OUT={self.out_count}")
-            st.zone_state = "OUTSIDE"
-            st.prev_side  = "L"
+        else:
+            # current_side is "L" or "R"
+            # ── Debounce: accumulate consecutive frames on this side ──────
+            if st.debounce_side != current_side:
+                st.debounce_side = current_side
+                st.side_frames   = 1
+            else:
+                st.side_frames  += 1
 
-        elif current_side == "R":
-            if st.zone_state == "ZONE" and st.prev_side == "L":
-                # Confirmed crossing: OUTSIDE → ZONE → INSIDE  =  ENTER
-                if st.counted != "IN":
-                    self.in_count += 1
-                    st.counted    = "IN"
-                    st.flash      = FLASH_FRAMES
-                    event         = "IN"
-                    self.events.append({
-                        "frame": frame_no, "id": tid, "event": "IN",
-                        "in": self.in_count, "out": self.out_count
-                    })
-                    print(f"[{frame_no:05d}] ID {tid:3d} ENTERED| IN={self.in_count} OUT={self.out_count}")
-            st.zone_state = "INSIDE"
-            st.prev_side  = "R"
+            # Only commit transition after DEBOUNCE_N consecutive frames
+            if st.side_frames >= DEBOUNCE_N:
+                if current_side == "L":
+                    if st.zone_state == "ZONE" and st.prev_side == "R":
+                        # Confirmed crossing: INSIDE → ZONE → OUTSIDE  =  EXIT
+                        if st.counted != "OUT":
+                            self.out_count += 1
+                            st.counted     = "OUT"
+                            st.flash       = FLASH_FRAMES
+                            event          = "OUT"
+                            self.events.append({
+                                "frame": frame_no, "id": tid, "event": "OUT",
+                                "in": self.in_count, "out": self.out_count
+                            })
+                            print(f"[{frame_no:05d}] ID {tid:3d} LEFT   | IN={self.in_count} OUT={self.out_count}")
+                    st.zone_state = "OUTSIDE"
+                    st.prev_side  = "L"
+
+                elif current_side == "R":
+                    if st.zone_state == "ZONE" and st.prev_side == "L":
+                        # Confirmed crossing: OUTSIDE → ZONE → INSIDE  =  ENTER
+                        if st.counted != "IN":
+                            self.in_count += 1
+                            st.counted    = "IN"
+                            st.flash      = FLASH_FRAMES
+                            event         = "IN"
+                            self.events.append({
+                                "frame": frame_no, "id": tid, "event": "IN",
+                                "in": self.in_count, "out": self.out_count
+                            })
+                            print(f"[{frame_no:05d}] ID {tid:3d} ENTERED| IN={self.in_count} OUT={self.out_count}")
+                    st.zone_state = "INSIDE"
+                    st.prev_side  = "R"
 
         return event
 
@@ -417,24 +428,31 @@ class BusCounter:
                     break
                 frame_no += 1
 
-                # ── Detection ─────────────────────────────────────────────
-                results = self.model(
+                # ── Detection + Tracking (BoT-SORT with ReID) ────────────
+                results = self.model.track(
                     frame,
                     classes=[0],
                     conf=CONF_THRESH,
                     iou=IOU_THRESH,
                     verbose=False,
                     agnostic_nms=True,
+                    tracker=TRACKER_CONFIG,
+                    persist=True,
                 )[0]
 
-                dets = sv.Detections(
-                    xyxy=results.boxes.xyxy.cpu().numpy(),
-                    confidence=results.boxes.conf.cpu().numpy(),
-                    class_id=results.boxes.cls.cpu().numpy().astype(int),
-                )
+                boxes = results.boxes
+                xyxy  = boxes.xyxy.cpu().numpy()
+                confs = boxes.conf.cpu().numpy()
+                cls   = boxes.cls.cpu().numpy().astype(int)
+                tids  = boxes.id
+                tids  = tids.cpu().numpy().astype(int) if tids is not None else None
 
-                # ── Tracking ──────────────────────────────────────────────
-                dets = self.tracker.update_with_detections(dets)
+                dets = sv.Detections(
+                    xyxy=xyxy,
+                    confidence=confs,
+                    class_id=cls,
+                    tracker_id=tids,
+                )
 
                 # ── State update ──────────────────────────────────────────
                 if dets.tracker_id is not None:
@@ -482,7 +500,7 @@ def main():
     p = argparse.ArgumentParser(description="Bus Passenger Counter v3")
     p.add_argument("--source",  default="counting.mp4",   help="Input video")
     p.add_argument("--output",  default="result_v3.mp4",  help="Output video")
-    p.add_argument("--model",   default="yolov8n.pt",     help="YOLO weights")
+    p.add_argument("--model",   default="yolov8s.pt",     help="YOLO weights")
     p.add_argument("--line",    type=float, default=LINE_RATIO,
                    help="Trigger line fraction of frame width (default 0.50)")
     p.add_argument("--no-preview", action="store_true",
