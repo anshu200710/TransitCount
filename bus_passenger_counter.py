@@ -29,6 +29,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime
 import csv, os, argparse
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
 
 # ═══════════════════════════════════════════════════════
 #  CONFIGURATION  — edit these to tune for your scene
@@ -42,6 +45,8 @@ TRAIL_LEN      = 50      # Centroid history length per ID
 GHOST_TIMEOUT  = 150     # Purge ID state after this many frames of absence
 FLASH_FRAMES   = 20      # How long the cyan count-flash lasts
 EMA_ALPHA      = 0.40    # Centroid smoothing (0=frozen, 1=raw)
+EXEMPT_THRESH  = 0.70    # Cosine similarity threshold for exempt match
+EXEMPT_SAMPLES = 5       # Frames to collect before deciding exempt status
 
 # BoT-SORT tracker config (see botsort.yaml for full settings)
 TRACKER_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botsort.yaml")
@@ -55,6 +60,7 @@ COL_BOX_FLASH = (255, 255, 0)    # cyan flash on count
 COL_BOX_SKIP  = (80,  80, 80)    # gray — skipped ID (first seen inside)
 COL_IN_TEXT   = (80, 255, 80)    # green text
 COL_OUT_TEXT  = (80, 180, 255)   # blue text
+COL_EXEMPT    = (255, 0, 200)    # magenta — exempt person
 
 
 # ═══════════════════════════════════════════════════════
@@ -112,6 +118,9 @@ class TrackState:
     side_frames: int  = 0        # consecutive frames on current confirmed side
     prev_side:   str  = ""       # last confirmed non-ZONE side
     debounce_side: str = ""      # which side we are accumulating debounce for
+    exempt:      bool = False    # True if matched as exempt person
+    embed_crops: list = field(default_factory=list)   # crops for embedding
+    embed_done:  bool = False    # True after exemption check is complete
 
 
 # ═══════════════════════════════════════════════════════
@@ -120,7 +129,8 @@ class TrackState:
 class BusCounter:
 
     def __init__(self, video_path: str, model_path: str = "yolov8s.pt",
-                 output_path: str = "result_v3.mp4"):
+                 output_path: str = "result_v3.mp4",
+                 exempt_path: str = ""):
         self.video_path  = video_path
         self.output_path = output_path
         self.model       = YOLO(model_path)
@@ -128,6 +138,25 @@ class BusCounter:
         self.in_count  = 0
         self.out_count = 0
         self.events: list[dict] = []   # for CSV
+
+        # ── Exempt person setup ───────────────────────────────────────────
+        self.exempt_emb  = None
+        self.feat_model  = None
+        if exempt_path and os.path.isfile(exempt_path):
+            self.exempt_emb = np.load(exempt_path)
+            print(f"Loaded exempt embedding from {exempt_path}")
+            # MobileNetV2 feature extractor (same as enroll_exempt.py)
+            net = models.mobilenet_v2(weights="DEFAULT")
+            net.classifier = nn.Identity()
+            net.eval()
+            self.feat_model = net
+            self.feat_tfm   = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225]),
+            ])
 
     # ── helpers ──────────────────────────────────────────────────────────
 
@@ -147,8 +176,35 @@ class BusCounter:
 
     # ── per-frame track update ────────────────────────────────────────────
 
+    def _extract_embedding(self, crop_bgr: np.ndarray) -> np.ndarray:
+        """Extract L2-normalised 1280-d embedding from a BGR crop."""
+        crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+        tensor   = self.feat_tfm(crop_rgb).unsqueeze(0)
+        with torch.no_grad():
+            feat = self.feat_model(tensor)
+        vec  = feat.squeeze().numpy()
+        norm = np.linalg.norm(vec)
+        return vec / norm if norm > 0 else vec
+
+    def _check_exempt(self, st: 'TrackState') -> None:
+        """After enough samples, decide if this track is the exempt person."""
+        if len(st.embed_crops) < EXEMPT_SAMPLES:
+            return
+        embs = [self._extract_embedding(c) for c in st.embed_crops]
+        avg  = np.mean(embs, axis=0)
+        avg  = avg / (np.linalg.norm(avg) + 1e-8)
+        sim  = float(np.dot(avg, self.exempt_emb))
+        st.exempt     = sim >= EXEMPT_THRESH
+        st.embed_done = True
+        st.embed_crops.clear()          # free memory
+        if st.exempt:
+            print(f"  [EXEMPT] track matched (sim={sim:.3f})")
+
+    # ── per-frame track update ────────────────────────────────────────────
+
     def _update_track(self, tid: int, bbox: np.ndarray,
-                      line_x: int, frame_no: int) -> Optional[str]:
+                      line_x: int, frame_no: int,
+                      frame: np.ndarray = None) -> Optional[str]:
         x1, y1, x2, y2 = bbox.astype(int)
         raw_cx = (x1 + x2) / 2.0
         raw_cy = (y1 + y2) / 2.0
@@ -177,6 +233,20 @@ class BusCounter:
         st = self.states[tid]
         st.last_seen = frame_no
 
+        # ── Exempt person check (first N frames of each track) ────────────
+        if self.exempt_emb is not None and not st.embed_done:
+            h_frame = frame.shape[0] if frame is not None else 0
+            w_frame = frame.shape[1] if frame is not None else 0
+            cy1 = max(0, y1)
+            cx1 = max(0, x1)
+            cy2 = min(h_frame, y2)
+            cx2 = min(w_frame, x2)
+            if frame is not None and cy2 > cy1 and cx2 > cx1:
+                crop = frame[cy1:cy2, cx1:cx2]
+                if crop.size > 0:
+                    st.embed_crops.append(crop.copy())
+                    self._check_exempt(st)
+
         # ── Kalman update ─────────────────────────────────────────────────
         pred_cx, pred_cy = st.kalman.update(raw_cx, raw_cy)
         # Blend Kalman prediction with EMA of raw for robustness
@@ -187,7 +257,9 @@ class BusCounter:
         if st.flash > 0:
             st.flash -= 1
 
-        # SKIP IDs never count
+        # Exempt and SKIP IDs never count
+        if st.exempt:
+            return None
         if st.zone_state == "SKIP":
             return None
 
@@ -312,7 +384,9 @@ class BusCounter:
                              cv2.LINE_AA)
 
             # ── Bounding box color ─────────────────────────────────────────
-            if st.zone_state == "SKIP":
+            if st.exempt:
+                col = COL_EXEMPT
+            elif st.zone_state == "SKIP":
                 col = COL_BOX_SKIP
             elif st.flash > 0:
                 col = COL_BOX_FLASH      # CYAN on count event
@@ -328,7 +402,10 @@ class BusCounter:
             cv2.circle(frame, (cx, cy), 5, col, 2)
 
             # ── Label ─────────────────────────────────────────────────────
-            if st.counted == "IN":
+            if st.exempt:
+                tag_col = COL_EXEMPT
+                tag     = f"#{tid} EXEMPT"
+            elif st.counted == "IN":
                 tag_col = COL_IN_TEXT
                 tag     = f"#{tid} IN"
             elif st.counted == "OUT":
@@ -457,7 +534,8 @@ class BusCounter:
                 # ── State update ──────────────────────────────────────────
                 if dets.tracker_id is not None:
                     for bbox, tid in zip(dets.xyxy, dets.tracker_id):
-                        self._update_track(int(tid), bbox, line_x, frame_no)
+                        self._update_track(int(tid), bbox, line_x, frame_no,
+                                           frame)
 
                 # ── Ghost cleanup ─────────────────────────────────────────
                 if frame_no % 90 == 0:
@@ -503,6 +581,8 @@ def main():
     p.add_argument("--model",   default="yolov8s.pt",     help="YOLO weights")
     p.add_argument("--line",    type=float, default=LINE_RATIO,
                    help="Trigger line fraction of frame width (default 0.50)")
+    p.add_argument("--exempt",  default="",
+                   help="Path to exempt_embedding.npy (skip counting this person)")
     p.add_argument("--no-preview", action="store_true",
                    help="Disable live preview (faster headless runs)")
     args = p.parse_args()
@@ -513,6 +593,7 @@ def main():
         video_path  = args.source,
         model_path  = args.model,
         output_path = args.output,
+        exempt_path = args.exempt,
     )
     counter.process()
 
