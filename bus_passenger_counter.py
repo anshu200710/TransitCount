@@ -1,23 +1,7 @@
 #!/usr/bin/env python3
 """
-Bus Passenger Counter — v3 DEFINITIVE
-======================================
-Camera: overhead/top-down at bus front gate
-Direction: passengers move LEFT → RIGHT to enter, RIGHT → LEFT to exit
-
-All confirmed bugs from video analysis fixed:
-  ✓ Line moved to 50% width (was 38% — too early to init ID)
-  ✓ "???IN" ghost counts fixed — IDs first seen inside dead zone are SKIPPED
-  ✓ IDs first seen on RIGHT side (already inside bus) cannot trigger IN count
-  ✓ Proper 3-state machine: OUTSIDE → ZONE → INSIDE (must traverse all 3)
-  ✓ Kalman Filter per track for smooth centroid prediction during occlusion
-  ✓ conf=0.12, iou=0.40 — separates shoulder-to-shoulder passengers
-  ✓ ByteTrack: buffer=150 frames (5s), low activation threshold
-  ✓ CYAN flash on confirmed count (auditable in real-time)
-  ✓ Trail lines with age-based color gradient
-  ✓ Ghost ID cleanup every 90 frames
-  ✓ CSV logs every event with frame + timestamp
-  ✓ agnostic_nms=True prevents class-merging of overlapping detections
+Bus Passenger Counter — v3.6 BACK TO NORMAL
+===========================================
 """
 
 import cv2
@@ -31,549 +15,203 @@ from datetime import datetime
 import csv, os, argparse
 
 # ═══════════════════════════════════════════════════════
-#  CONFIGURATION  — edit these to tune for your scene
+#  CONFIGURATION
 # ═══════════════════════════════════════════════════════
-LINE_RATIO     = 0.45    # Trigger line at 45% frame width
-DEAD_ZONE_PX   = 30      # ±30 px either side of line = 60 px total buffer zone
-DEBOUNCE_N     = 3       # Frames needed on same side to commit to that side
-CONF_THRESH    = 0.12    # Low — catches partial bodies / shoulders only
-IOU_THRESH     = 0.40    # Low — keeps separate boxes for side-by-side people
-TRAIL_LEN      = 50      # Centroid history length per ID
-GHOST_TIMEOUT  = 150     # Purge ID state after this many frames of absence
-FLASH_FRAMES   = 20      # How long the cyan count-flash lasts
-EMA_ALPHA      = 0.40    # Centroid smoothing (0=frozen, 1=raw)
-BADGE_MIN_PX   = 30      # Min pixels of badge color to trigger exemption
-BADGE_STREAK   = 2       # Must see badge for this many frames to confirm
+LINE_RATIO     = 0.45    
+DEAD_ZONE_PX   = 30      
+DEBOUNCE_N     = 3       
+CONF_THRESH    = 0.12    
+IOU_THRESH     = 0.40    
+TRAIL_LEN      = 50      
+GHOST_TIMEOUT  = 150     
+FLASH_FRAMES   = 20      
+EMA_ALPHA      = 0.40    
+BADGE_MIN_PX   = 20      
 
-# BoT-SORT tracker config (see botsort.yaml for full settings)
+# BoT-SORT tracker config
 TRACKER_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botsort.yaml")
 
 # Colours (BGR)
-COL_LINE      = (0,  0,   220)   # red trigger line
-COL_ZONE_L    = (255, 80, 0)     # left dead-zone border (blue)
-COL_ZONE_R    = (0, 180, 255)    # right dead-zone border (amber)
-COL_BOX_NORM  = (0, 140, 255)    # normal bbox (orange)
-COL_BOX_FLASH = (255, 255, 0)    # cyan flash on count
-COL_BOX_SKIP  = (80,  80, 80)    # gray — skipped ID (first seen inside)
-COL_IN_TEXT   = (80, 255, 80)    # green text
-COL_OUT_TEXT  = (80, 180, 255)   # blue text
-COL_EXEMPT    = (255, 0, 200)    # magenta — exempt person
+COL_LINE      = (0,  0,   220)
+COL_ZONE_L    = (255, 80, 0)
+COL_ZONE_R    = (0, 140, 0)
+COL_BOX_NORM  = (0, 140, 255)
+COL_BOX_FLASH = (255, 255, 0)
+COL_BOX_SKIP  = (80,  80, 80)
+COL_IN_TEXT   = (80, 255, 80)
+COL_OUT_TEXT  = (80, 180, 255)
+COL_EXEMPT    = (255, 0, 200)
 
+@dataclass
+class TrackState:
+    kalman:      'KalmanCentroid'
+    cx:          float
+    cy:          float
+    trail:       deque = field(default_factory=lambda: deque(maxlen=TRAIL_LEN))
+    zone_state:  str   = "INIT"
+    counted:     Optional[str] = None
+    flash:       int   = 0
+    last_seen:   int   = 0
+    side_frames: int   = 0
+    prev_side:   str   = ""
+    debounce_side: str = ""
+    exempt:      bool  = False
 
-# ═══════════════════════════════════════════════════════
-#  KALMAN FILTER  — 4-state: [cx, cy, vx, vy]
-# ═══════════════════════════════════════════════════════
 class KalmanCentroid:
-    """Constant-velocity Kalman filter for centroid smoothing."""
-
     def __init__(self, cx: float, cy: float):
         self.kf = cv2.KalmanFilter(4, 2)
         self.kf.measurementMatrix  = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
-        self.kf.transitionMatrix   = np.array([[1,0,1,0],[0,1,0,1],
-                                                [0,0,1,0],[0,0,0,1]], np.float32)
+        self.kf.transitionMatrix   = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], np.float32)
         self.kf.processNoiseCov    = np.eye(4, dtype=np.float32) * 0.03
         self.kf.measurementNoiseCov= np.eye(2, dtype=np.float32) * 0.5
-        self.kf.errorCovPost       = np.eye(4, dtype=np.float32)
         self.kf.statePost          = np.array([[cx],[cy],[0],[0]], np.float32)
-
-    def update(self, cx: float, cy: float) -> tuple[float, float]:
-        pred = self.kf.predict()
+    def update(self, cx: float, cy: float):
+        self.kf.predict()
         meas = np.array([[cx],[cy]], np.float32)
-        self.kf.correct(meas)
-        return float(pred[0, 0]), float(pred[1, 0])
+        res = self.kf.correct(meas)
+        return float(res[0,0]), float(res[1,0])
 
-    def predict(self) -> tuple[float, float]:
-        pred = self.kf.predict()
-        return float(pred[0, 0]), float(pred[1, 0])
-
-
-# ═══════════════════════════════════════════════════════
-#  PER-TRACK STATE MACHINE
-# ═══════════════════════════════════════════════════════
-@dataclass
-class TrackState:
-    """
-    3-state crossing machine per track ID.
-
-    States:
-      OUTSIDE  — centroid firmly on the LEFT of dead zone  (entry side)
-      ZONE     — centroid inside the dead zone             (crossing)
-      INSIDE   — centroid firmly on the RIGHT              (bus interior)
-
-    Valid counting transition:  OUTSIDE → ZONE → INSIDE  (+1 IN)
-    Valid exit transition:      INSIDE  → ZONE → OUTSIDE  (+1 OUT)
-    Invalid (skip):             ID first seen in ZONE or INSIDE
-    """
-    kalman:      KalmanCentroid
-    cx:          float            # smoothed centroid x
-    cy:          float            # smoothed centroid y
-    trail:       deque = field(default_factory=lambda: deque(maxlen=TRAIL_LEN))
-    zone_state:  str  = "INIT"   # INIT | OUTSIDE | ZONE | INSIDE | SKIP
-    counted:     Optional[str] = None   # None | 'IN' | 'OUT'
-    flash:       int  = 0
-    last_seen:   int  = 0
-    side_frames: int  = 0        # consecutive frames on current confirmed side
-    prev_side:   str  = ""       # last confirmed non-ZONE side
-    debounce_side: str = ""      # which side we are accumulating debounce for
-    exempt:      bool = False    # True if badge detected
-    badge_count: int  = 0        # consecutive frames badge was seen
-
-
-# ═══════════════════════════════════════════════════════
-#  MAIN COUNTER CLASS
-# ═══════════════════════════════════════════════════════
 class BusCounter:
-
-    def __init__(self, video_path: str, model_path: str = "yolov8s.pt",
-                 output_path: str = "result_v3.mp4"):
+    def __init__(self, video_path: str, model_path: str = "yolov8s.pt", output_path: str = "result_v3.mp4"):
         self.video_path  = video_path
         self.output_path = output_path
         self.model       = YOLO(model_path)
         self.states: dict[int, TrackState] = {}
         self.in_count  = 0
         self.out_count = 0
-        self.events: list[dict] = []   # for CSV
-
-    # ── helpers ──────────────────────────────────────────────────────────
+        self.events: list[dict] = []
 
     def _get_side(self, cx: float, line_x: int) -> str:
-        """Returns 'L', 'R', or 'ZONE'."""
-        if cx < line_x - DEAD_ZONE_PX:
-            return "L"
-        if cx > line_x + DEAD_ZONE_PX:
-            return "R"
+        if cx < line_x - DEAD_ZONE_PX: return "L"
+        if cx > line_x + DEAD_ZONE_PX: return "R"
         return "ZONE"
 
-    def _purge_ghosts(self, frame_no: int):
-        dead = [tid for tid, s in self.states.items()
-                if frame_no - s.last_seen > GHOST_TIMEOUT]
-        for tid in dead:
-            del self.states[tid]
-
-    # ── per-frame track update ────────────────────────────────────────────
-
-    def _has_badge(self, crop: np.ndarray) -> bool:
-        """
-        Detects the Indian flag rosette badge (Saffron/Green).
-        Returns True if a significant cluster of these colors is found.
-        """
-        if crop is None or crop.size == 0:
-            return False
-            
+    def _has_badge(self, crop: np.ndarray, tid: int) -> bool:
+        if crop is None or crop.size == 0: return False
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         
-        # Saffron/Orange: Hue 5-18, High Saturation
-        lower_saffron = np.array([5, 130, 100])
-        upper_saffron = np.array([18, 255, 255])
-        
-        # Green: Hue 60-90, High Saturation
-        lower_green = np.array([60, 100, 50])
-        upper_green = np.array([90, 255, 255])
-        
-        mask_s = cv2.inRange(hsv, lower_saffron, upper_saffron)
-        mask_g = cv2.inRange(hsv, lower_green, upper_green)
-        
-        # We look for a cluster of either saffron or green
-        s_pixels = np.sum(mask_s > 0)
-        g_pixels = np.sum(mask_g > 0)
-        
-        return s_pixels > BADGE_MIN_PX or g_pixels > BADGE_MIN_PX
+        # Calibration Logger
+        m_s_all = cv2.inRange(hsv, np.array([0, 50, 50]), np.array([25, 255, 255]))
+        m_g_all = cv2.inRange(hsv, np.array([60, 50, 40]), np.array([95, 255, 255]))
+        max_s = int(np.max(hsv[:,:,1], where=m_s_all>0, initial=0))
+        max_g = int(np.max(hsv[:,:,1], where=m_g_all>0, initial=0))
+        if max_s > 100 or max_g > 50:
+            print(f"  [DEBUG ID {tid:2d}] Peak Sat -> Saffron: {max_s}, Green: {max_g}")
 
-    # ── per-frame track update ────────────────────────────────────────────
+        # Calibrated Math
+        mask_s = cv2.inRange(hsv, np.array([0, 160, 80]), np.array([25, 255, 255]))
+        mask_g = cv2.inRange(hsv, np.array([60, 60, 40]), np.array([95, 255, 255]))
+        
+        if np.sum(mask_s > 0) > BADGE_MIN_PX and np.sum(mask_g > 0) > 3:
+            dilated_s = cv2.dilate(mask_s, np.ones((7,7), np.uint8), iterations=2)
+            if np.sum(cv2.bitwise_and(dilated_s, mask_g) > 0) > 1:
+                return True
+        return False
 
-    def _update_track(self, tid: int, bbox: np.ndarray,
-                      line_x: int, frame_no: int,
-                      frame: np.ndarray = None) -> Optional[str]:
+    def _update_track(self, tid, bbox, line_x, f_no, frame):
         x1, y1, x2, y2 = bbox.astype(int)
-        raw_cx = (x1 + x2) / 2.0
-        raw_cy = (y1 + y2) / 2.0
-
-        # ── Init new track ────────────────────────────────────────────────
+        raw_cx, raw_cy = (x1+x2)/2.0, (y1+y2)/2.0
         if tid not in self.states:
-            kf   = KalmanCentroid(raw_cx, raw_cy)
             side = self._get_side(raw_cx, line_x)
-            st   = TrackState(kalman=kf, cx=raw_cx, cy=raw_cy,
-                              last_seen=frame_no)
-
-            # Critical: classify first-seen position
-            if side == "L":
-                st.zone_state = "OUTSIDE"
-                st.prev_side  = "L"
-            elif side == "R":
-                # Already inside — can only count OUT, never IN
-                st.zone_state = "INSIDE"
-                st.prev_side  = "R"
-            else:
-                # First seen in dead zone — cannot count in either direction
-                st.zone_state = "SKIP"
-
+            st = TrackState(kalman=KalmanCentroid(raw_cx, raw_cy), cx=raw_cx, cy=raw_cy, last_seen=f_no)
+            if side == "L": st.zone_state, st.prev_side = "OUTSIDE", "L"
+            elif side == "R": st.zone_state, st.prev_side = "INSIDE", "R"
+            else: st.zone_state = "SKIP"
             self.states[tid] = st
-
         st = self.states[tid]
-        st.last_seen = frame_no
+        st.last_seen = f_no
 
-        # ── Color-based Badge check ───────────────────────────────────────
         if not st.exempt:
-            h_f, w_f = frame.shape[:2] if frame is not None else (0, 0)
-            cy1, cx1 = max(0, y1), max(0, x1)
-            cy2, cx2 = min(h_f, y2), min(w_f, x2)
-            if frame is not None and cy2 > cy1 and cx2 > cx1:
-                crop = frame[cy1:cy2, cx1:cx2]
-                if self._has_badge(crop):
-                    st.badge_count += 1
-                    if st.badge_count >= BADGE_STREAK:
-                        st.exempt = True
-                        print(f"  [EXEMPT] Badge detected on track #{tid}")
-                else:
-                    st.badge_count = 0  # reset if not seen in this frame
+            crop = frame[max(0,y1):min(frame.shape[0],y2), max(0,x1):min(frame.shape[1],x2)]
+            if self._has_badge(crop, tid):
+                st.exempt = True
+                print(f"  [EXEMPT] ID {tid} Badge verified.")
 
-        # ── Kalman update ─────────────────────────────────────────────────
-        pred_cx, pred_cy = st.kalman.update(raw_cx, raw_cy)
-        # Blend Kalman prediction with EMA of raw for robustness
-        st.cx = EMA_ALPHA * raw_cx + (1 - EMA_ALPHA) * pred_cx
-        st.cy = EMA_ALPHA * raw_cy + (1 - EMA_ALPHA) * pred_cy
+        pcx, pcy = st.kalman.update(raw_cx, raw_cy)
+        st.cx, st.cy = EMA_ALPHA * raw_cx + (1-EMA_ALPHA) * pcx, EMA_ALPHA * raw_cy + (1-EMA_ALPHA) * pcy
         st.trail.append((int(st.cx), int(st.cy)))
+        if st.flash > 0: st.flash -= 1
+        
+        if st.exempt or st.zone_state == "SKIP": return
 
-        if st.flash > 0:
-            st.flash -= 1
-
-        # Exempt and SKIP IDs never count
-        if st.exempt:
-            return None
-        if st.zone_state == "SKIP":
-            return None
-
-        # ── Cooldown after count — freeze state transitions ──────────────
-        if st.flash > 0:
-            return None
-
-        # ── Side classification ───────────────────────────────────────────
-        current_side = self._get_side(st.cx, line_x)
-
-        # ── State machine transitions (with debounce) ─────────────────────
-        event = None
-
-        if current_side == "ZONE":
-            # Entering dead zone — transition immediately, reset debounce
-            if st.zone_state in ("OUTSIDE", "INSIDE"):
-                st.zone_state = "ZONE"
-            st.side_frames   = 0
-            st.debounce_side = ""
-            # In zone — no count possible, wait for exit
-
+        side = self._get_side(st.cx, line_x)
+        if side == "ZONE": st.zone_state, st.side_frames, st.debounce_side = "ZONE", 0, ""
         else:
-            # current_side is "L" or "R"
-            # ── Debounce: accumulate consecutive frames on this side ──────
-            if st.debounce_side != current_side:
-                st.debounce_side = current_side
-                st.side_frames   = 1
-            else:
-                st.side_frames  += 1
-
-            # Only commit transition after DEBOUNCE_N consecutive frames
+            if st.debounce_side != side: st.debounce_side, st.side_frames = side, 1
+            else: st.side_frames += 1
             if st.side_frames >= DEBOUNCE_N:
-                if current_side == "L":
-                    if st.zone_state == "ZONE" and st.prev_side == "R":
-                        # Confirmed crossing: INSIDE → ZONE → OUTSIDE  =  EXIT
-                        if st.counted != "OUT":
-                            self.out_count += 1
-                            st.counted     = "OUT"
-                            st.flash       = FLASH_FRAMES
-                            event          = "OUT"
-                            self.events.append({
-                                "frame": frame_no, "id": tid, "event": "OUT",
-                                "in": self.in_count, "out": self.out_count
-                            })
-                            print(f"[{frame_no:05d}] ID {tid:3d} LEFT   | IN={self.in_count} OUT={self.out_count}")
-                    st.zone_state = "OUTSIDE"
-                    st.prev_side  = "L"
-
-                elif current_side == "R":
-                    if st.zone_state == "ZONE" and st.prev_side == "L":
-                        # Confirmed crossing: OUTSIDE → ZONE → INSIDE  =  ENTER
-                        if st.counted != "IN":
-                            self.in_count += 1
-                            st.counted    = "IN"
-                            st.flash      = FLASH_FRAMES
-                            event         = "IN"
-                            self.events.append({
-                                "frame": frame_no, "id": tid, "event": "IN",
-                                "in": self.in_count, "out": self.out_count
-                            })
-                            print(f"[{frame_no:05d}] ID {tid:3d} ENTERED| IN={self.in_count} OUT={self.out_count}")
-                    st.zone_state = "INSIDE"
-                    st.prev_side  = "R"
-
-        return event
-
-    # ── drawing ───────────────────────────────────────────────────────────
-
-    def _draw_zones(self, frame: np.ndarray, line_x: int) -> np.ndarray:
-        h = frame.shape[0]
-        ov = frame.copy()
-
-        # Left zone (outside) — very subtle blue tint
-        cv2.rectangle(ov, (0, 0), (line_x - DEAD_ZONE_PX, h), (180, 60, 0), -1)
-        # Right zone (inside bus) — very subtle green tint
-        cv2.rectangle(ov, (line_x + DEAD_ZONE_PX, 0), (frame.shape[1], h), (0, 140, 0), -1)
-        frame = cv2.addWeighted(ov, 0.06, frame, 0.94, 0)
-
-        # Dead zone strip — yellow tint
-        ov2 = frame.copy()
-        cv2.rectangle(ov2, (line_x - DEAD_ZONE_PX, 0),
-                      (line_x + DEAD_ZONE_PX, h), (0, 200, 255), -1)
-        frame = cv2.addWeighted(ov2, 0.18, frame, 0.82, 0)
-
-        # Lines
-        cv2.line(frame, (line_x, 0), (line_x, h), COL_LINE, 2)
-        cv2.line(frame, (line_x - DEAD_ZONE_PX, 0),
-                 (line_x - DEAD_ZONE_PX, h), (0, 180, 255), 1)
-        cv2.line(frame, (line_x + DEAD_ZONE_PX, 0),
-                 (line_x + DEAD_ZONE_PX, h), (0, 180, 255), 1)
-
-        # Labels
-        cv2.putText(frame, "OUTSIDE", (10, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 255), 1, cv2.LINE_AA)
-        cv2.putText(frame, "INSIDE", (line_x + DEAD_ZONE_PX + 6, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 255, 80), 1, cv2.LINE_AA)
-        cv2.putText(frame, "ZONE", (line_x - DEAD_ZONE_PX + 4, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1, cv2.LINE_AA)
-        return frame
-
-    def _draw_tracks(self, frame: np.ndarray, dets: sv.Detections) -> np.ndarray:
-        if dets.tracker_id is None:
-            return frame
-
-        for bbox, tid in zip(dets.xyxy, dets.tracker_id):
-            tid = int(tid)
-            st  = self.states.get(tid)
-            if st is None:
-                continue
-
-            x1, y1, x2, y2 = bbox.astype(int)
-
-            # ── Trail ─────────────────────────────────────────────────────
-            pts = list(st.trail)
-            if len(pts) > 1:
-                for j in range(1, len(pts)):
-                    t     = j / max(len(pts) - 1, 1)
-                    blue  = int(255 * (1 - t))
-                    green = int(200 * t)
-                    red   = int(120 * t)
-                    cv2.line(frame, pts[j-1], pts[j], (blue, green, red), 2,
-                             cv2.LINE_AA)
-
-            # ── Bounding box color ─────────────────────────────────────────
-            if st.exempt:
-                col = COL_EXEMPT
-            elif st.zone_state == "SKIP":
-                col = COL_BOX_SKIP
-            elif st.flash > 0:
-                col = COL_BOX_FLASH      # CYAN on count event
-            else:
-                col = COL_BOX_NORM       # Orange normally
-
-            thick = 3 if st.flash > 0 else 2
-            cv2.rectangle(frame, (x1, y1), (x2, y2), col, thick)
-
-            # ── Centroid dot ───────────────────────────────────────────────
-            cx, cy = int(st.cx), int(st.cy)
-            cv2.circle(frame, (cx, cy), 5, (255, 255, 255), -1)
-            cv2.circle(frame, (cx, cy), 5, col, 2)
-
-            # ── Label ─────────────────────────────────────────────────────
-            if st.exempt:
-                tag_col = COL_EXEMPT
-                tag     = f"#{tid} EXEMPT"
-            elif st.counted == "IN":
-                tag_col = COL_IN_TEXT
-                tag     = f"#{tid} IN"
-            elif st.counted == "OUT":
-                tag_col = COL_OUT_TEXT
-                tag     = f"#{tid} OUT"
-            elif st.zone_state == "SKIP":
-                tag_col = COL_BOX_SKIP
-                tag     = f"#{tid} skip"
-            else:
-                tag_col = (200, 200, 200)
-                tag     = f"#{tid} {st.zone_state[:3]}"
-
-            cv2.putText(frame, tag, (x1, y1 - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, tag_col, 1, cv2.LINE_AA)
-
-        return frame
-
-    def _draw_dashboard(self, frame: np.ndarray, frame_no: int,
-                        fps: float) -> np.ndarray:
-        h, w   = frame.shape[:2]
-        dw, dh = 220, 130
-        margin = 14
-        x1 = w - dw - margin
-        y1 = margin
-
-        ov = frame.copy()
-        cv2.rectangle(ov, (x1, y1), (x1 + dw, y1 + dh), (12, 12, 12), -1)
-        frame = cv2.addWeighted(ov, 0.70, frame, 0.30, 0)
-
-        # Green accent bar
-        cv2.rectangle(frame, (x1, y1), (x1 + dw, y1 + 3), (0, 200, 80), -1)
-
-        inside = max(0, self.in_count - self.out_count)
-        rows   = [
-            ("ENTERED", self.in_count,  COL_IN_TEXT),
-            ("LEFT",    self.out_count, COL_OUT_TEXT),
-            ("INSIDE",  inside,         (80, 220, 255)),
-        ]
-        for i, (label, val, col) in enumerate(rows):
-            y = y1 + 34 + i * 32
-            cv2.putText(frame, f"{label}:", (x1 + 10, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (160, 160, 160), 1, cv2.LINE_AA)
-            cv2.putText(frame, str(val), (x1 + 148, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.62, col, 2, cv2.LINE_AA)
-
-        # Frame counter
-        ts = f"f{frame_no}  {frame_no/fps:.1f}s"
-        cv2.putText(frame, ts, (x1 + 10, y1 + dh - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (80, 80, 80), 1, cv2.LINE_AA)
-        return frame
-
-    # ── CSV ───────────────────────────────────────────────────────────────
-
-    def _save_csv(self, path: str):
-        with open(path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["frame", "timestamp", "id",
-                                               "event", "in", "out", "inside"])
-            w.writeheader()
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            for ev in self.events:
-                w.writerow({
-                    "frame":     ev["frame"],
-                    "timestamp": ts,
-                    "id":        ev["id"],
-                    "event":     ev["event"],
-                    "in":        ev["in"],
-                    "out":       ev["out"],
-                    "inside":    ev["in"] - ev["out"],
-                })
-        print(f"CSV saved: {path}")
-
-    # ── main loop ─────────────────────────────────────────────────────────
+                if side == "L" and st.zone_state == "ZONE" and st.prev_side == "R":
+                    if st.counted != "OUT":
+                        self.out_count += 1
+                        st.counted, st.flash = "OUT", FLASH_FRAMES
+                        self.events.append({"frame": f_no, "id": tid, "event": "OUT", "in": self.in_count, "out": self.out_count})
+                        print(f"[{f_no:05d}] ID {tid:3d} LEFT   | IN={self.in_count} OUT={self.out_count}")
+                elif side == "R" and st.zone_state == "ZONE" and st.prev_side == "L":
+                    if st.counted != "IN":
+                        self.in_count += 1
+                        st.counted, st.flash = "IN", FLASH_FRAMES
+                        self.events.append({"frame": f_no, "id": tid, "event": "IN", "in": self.in_count, "out": self.out_count})
+                        print(f"[{f_no:05d}] ID {tid:3d} ENTERED| IN={self.in_count} OUT={self.out_count}")
+                st.zone_state, st.prev_side = ("OUTSIDE" if side=="L" else "INSIDE"), side
 
     def process(self):
         cap = cv2.VideoCapture(self.video_path)
-        if not cap.isOpened():
-            raise FileNotFoundError(f"Cannot open: {self.video_path}")
+        W, H, FPS = int(cap.get(3)), int(cap.get(4)), cap.get(5) or 30.0
+        line_x, writer = int(W * LINE_RATIO), cv2.VideoWriter(self.output_path, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (W, H))
+        f_no = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret: break
+            f_no += 1
+            res = self.model.track(frame, classes=[0], conf=CONF_THRESH, iou=IOU_THRESH, verbose=False, tracker=TRACKER_CONFIG, persist=True)[0]
+            if res.boxes.id is not None:
+                for b, tid in zip(res.boxes.xyxy.cpu().numpy(), res.boxes.id.cpu().numpy().astype(int)):
+                    self._update_track(tid, b, line_x, f_no, frame)
+            if f_no % 90 == 0:
+                self.states = {tid: s for tid, s in self.states.items() if f_no - s.last_seen < GHOST_TIMEOUT}
+            
+            # Premium Visuals
+            frame = self._draw_ui(frame, line_x, res)
+            writer.write(frame); cv2.imshow("Bus Counter", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
+        cap.release(); writer.release(); cv2.destroyAllWindows()
+        with open(self.output_path.replace(".mp4", ".csv"), "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["frame", "id", "event", "in", "out"])
+            w.writeheader(); w.writerows(self.events)
 
-        W   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        H   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        FPS = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        line_x = int(W * LINE_RATIO)
-
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(self.output_path, fourcc, FPS, (W, H))
-
-        print(f"Video: {W}x{H} @ {FPS:.1f}fps")
-        print(f"Trigger line at x={line_x} ({LINE_RATIO*100:.0f}% width)")
-        print(f"Dead zone: x=[{line_x-DEAD_ZONE_PX}, {line_x+DEAD_ZONE_PX}]")
-        print("─" * 55)
-
-        frame_no = 0
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frame_no += 1
-
-                # ── Detection + Tracking (BoT-SORT with ReID) ────────────
-                results = self.model.track(
-                    frame,
-                    classes=[0],
-                    conf=CONF_THRESH,
-                    iou=IOU_THRESH,
-                    verbose=False,
-                    agnostic_nms=True,
-                    tracker=TRACKER_CONFIG,
-                    persist=True,
-                )[0]
-
-                boxes = results.boxes
-                xyxy  = boxes.xyxy.cpu().numpy()
-                confs = boxes.conf.cpu().numpy()
-                cls   = boxes.cls.cpu().numpy().astype(int)
-                tids  = boxes.id
-                tids  = tids.cpu().numpy().astype(int) if tids is not None else None
-
-                dets = sv.Detections(
-                    xyxy=xyxy,
-                    confidence=confs,
-                    class_id=cls,
-                    tracker_id=tids,
-                )
-
-                # ── State update ──────────────────────────────────────────
-                if dets.tracker_id is not None:
-                    for bbox, tid in zip(dets.xyxy, dets.tracker_id):
-                        self._update_track(int(tid), bbox, line_x, frame_no,
-                                           frame)
-
-                # ── Ghost cleanup ─────────────────────────────────────────
-                if frame_no % 90 == 0:
-                    self._purge_ghosts(frame_no)
-
-                # ── Draw ──────────────────────────────────────────────────
-                frame = self._draw_zones(frame, line_x)
-                frame = self._draw_tracks(frame, dets)
-                frame = self._draw_dashboard(frame, frame_no, FPS)
-                writer.write(frame)
-
-                cv2.imshow("Bus Counter v3", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-
-        finally:
-            cap.release()
-            writer.release()
-            cv2.destroyAllWindows()
-
-            csv_path = self.output_path.replace(".mp4", ".csv")
-            self._save_csv(csv_path)
-
-            print("\n" + "═" * 55)
-            print(f"  Frames processed : {frame_no}")
-            print(f"  Total ENTERED    : {self.in_count}")
-            print(f"  Total LEFT       : {self.out_count}")
-            print(f"  Final INSIDE     : {max(0, self.in_count - self.out_count)}")
-            print(f"  Output video     : {self.output_path}")
-            print(f"  Event CSV        : {csv_path}")
-            print("═" * 55)
-
-
-# ═══════════════════════════════════════════════════════
-#  ENTRY POINT
-# ═══════════════════════════════════════════════════════
-def main():
-    global LINE_RATIO
-
-    p = argparse.ArgumentParser(description="Bus Passenger Counter v3")
-    p.add_argument("--source",  default="counting.mp4",   help="Input video")
-    p.add_argument("--output",  default="result_v3.mp4",  help="Output video")
-    p.add_argument("--model",   default="yolov8s.pt",     help="YOLO weights")
-    p.add_argument("--line",    type=float, default=LINE_RATIO,
-                   help="Trigger line fraction of frame width (default 0.50)")
-    p.add_argument("--no-preview", action="store_true",
-                   help="Disable live preview (faster headless runs)")
-    args = p.parse_args()
-
-    LINE_RATIO = args.line
-
-    counter = BusCounter(
-        video_path  = args.source,
-        model_path  = args.model,
-        output_path = args.output,
-    )
-    counter.process()
-
+    def _draw_ui(self, frame, line_x, res):
+        h, w = frame.shape[:2]
+        # Zones
+        ov = frame.copy()
+        cv2.rectangle(ov, (0, 0), (line_x - DEAD_ZONE_PX, h), (180, 60, 0), -1)
+        cv2.rectangle(ov, (line_x + DEAD_ZONE_PX, 0), (w, h), (0, 140, 0), -1)
+        frame = cv2.addWeighted(ov, 0.06, frame, 0.94, 0)
+        cv2.line(frame, (line_x, 0), (line_x, h), COL_LINE, 2)
+        # Dashboard
+        x1, y1, dw, dh = w - 220, 20, 200, 120
+        ov2 = frame.copy()
+        cv2.rectangle(ov2, (x1, y1), (x1+dw, y1+dh), (15,15,15), -1)
+        frame = cv2.addWeighted(ov2, 0.7, frame, 0.3, 0)
+        cv2.rectangle(frame, (x1, y1), (x1+dw, y1+3), (0,200,80), -1)
+        rows = [("ENTERED", self.in_count, COL_IN_TEXT), ("LEFT", self.out_count, COL_OUT_TEXT), ("INSIDE", max(0, self.in_count-self.out_count), (80,220,255))]
+        for i, (l, v, c) in enumerate(rows):
+            cv2.putText(frame, f"{l}: {v}", (x1+15, y1+35+i*30), 0, 0.55, c, 2)
+        # Tracks
+        if res.boxes.id is not None:
+            for b, tid in zip(res.boxes.xyxy.cpu().numpy(), res.boxes.id.cpu().numpy().astype(int)):
+                st = self.states.get(tid)
+                if not st: continue
+                x1, y1, x2, y2 = b.astype(int)
+                col = COL_EXEMPT if st.exempt else (COL_BOX_SKIP if st.zone_state == "SKIP" else (COL_BOX_FLASH if st.flash > 0 else COL_BOX_NORM))
+                cv2.rectangle(frame, (x1, y1), (x2, y2), col, (3 if st.flash > 0 else 2))
+                cv2.putText(frame, f"#{tid}" + (" EXEMPT" if st.exempt else ""), (x1, y1-10), 0, 0.5, col, 1)
+                pts = list(st.trail)
+                for j in range(1, len(pts)):
+                    t = j / max(len(pts)-1, 1)
+                    cv2.line(frame, pts[j-1], pts[j], (int(255*(1-t)), int(200*t), int(120*t)), 2)
+        return frame
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument("--source", default="testing.mp4"); p.add_argument("--output", default="result_v3.mp4")
+    args = p.parse_args(); BusCounter(args.source, output_path=args.output).process()
