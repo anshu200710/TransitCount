@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Bus Passenger Counter — v3 DEFINITIVE
-======================================
+Bus Passenger Counter — v3 DEFINITIVE + API Push
+==================================================
 Camera: overhead/top-down at bus front gate
 Direction: passengers move LEFT → RIGHT to enter, RIGHT → LEFT to exit
 
@@ -18,6 +18,13 @@ All confirmed bugs from video analysis fixed:
   ✓ Ghost ID cleanup every 90 frames
   ✓ CSV logs every event with frame + timestamp
   ✓ agnostic_nms=True prevents class-merging of overlapping detections
+
+API Push additions (v3.1):
+  ✓ Non-blocking POST via background thread + queue (zero FPS impact)
+  ✓ Payload: {datetime, hin, hout, inside, total}
+  ✓ 2-second request timeout — network hangs never stall the main loop
+  ✓ Max 2 retries on 5xx errors with short back-off
+  ✓ Triggered only on confirmed IN/OUT transitions (no duplicate calls)
 """
 
 import cv2
@@ -33,20 +40,38 @@ import torch
 import torch.nn as nn
 from torchvision import models, transforms
 
+# ── NEW: non-blocking API push imports ──────────────────────────────────
+import threading
+import queue
+import time
+try:
+    import requests
+    _REQUESTS_OK = True
+except ImportError:
+    _REQUESTS_OK = False
+    print("[WARN] 'requests' library not found. API push disabled. "
+          "Install with: pip install requests")
+
 # ═══════════════════════════════════════════════════════
 #  CONFIGURATION  — edit these to tune for your scene
 # ═══════════════════════════════════════════════════════
-LINE_RATIO     = 0.45    # Trigger line at 45% frame width
+LINE_RATIO     = 0.50    # Trigger line at 50% frame width
 DEAD_ZONE_PX   = 30      # ±30 px either side of line = 60 px total buffer zone
 DEBOUNCE_N     = 3       # Frames needed on same side to commit to that side
-CONF_THRESH    = 0.12    # Low — catches partial bodies / shoulders only
+CONF_THRESH    = 0.10    # Lower for more detections
 IOU_THRESH     = 0.40    # Low — keeps separate boxes for side-by-side people
 TRAIL_LEN      = 50      # Centroid history length per ID
-GHOST_TIMEOUT  = 150     # Purge ID state after this many frames of absence
+GHOST_TIMEOUT  = 300     # Purge ID state after this many frames of absence
 FLASH_FRAMES   = 20      # How long the cyan count-flash lasts
-EMA_ALPHA      = 0.40    # Centroid smoothing (0=frozen, 1=raw)
+EMA_ALPHA      = 0.60    # Centroid smoothing (0=frozen, 1=raw)
 EXEMPT_THRESH  = 0.70    # Cosine similarity threshold for exempt match
 EXEMPT_SAMPLES = 5       # Frames to collect before deciding exempt status
+
+# ── API configuration ────────────────────────────────────────────────────
+API_ENDPOINT   = "https://bae6-49-205-179-53.ngrok-free.app/passenger-count"
+API_TIMEOUT    = 2        # seconds — never block processing loop
+API_MAX_RETRY  = 2        # retries on 5xx errors
+API_RETRY_WAIT = 0.3      # seconds between retries
 
 # BoT-SORT tracker config (see botsort.yaml for full settings)
 TRACKER_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botsort.yaml")
@@ -61,6 +86,96 @@ COL_BOX_SKIP  = (80,  80, 80)    # gray — skipped ID (first seen inside)
 COL_IN_TEXT   = (80, 255, 80)    # green text
 COL_OUT_TEXT  = (80, 180, 255)   # blue text
 COL_EXEMPT    = (255, 0, 200)    # magenta — exempt person
+
+
+# ═══════════════════════════════════════════════════════
+#  NON-BLOCKING API WORKER
+# ═══════════════════════════════════════════════════════
+
+class ApiPushWorker:
+    """
+    Background daemon thread that drains a queue and fires POST requests.
+
+    The main video loop enqueues a payload dict and returns immediately —
+    network latency or retries never touch the processing thread.
+    """
+
+    def __init__(self, endpoint: str, timeout: int = API_TIMEOUT,
+                 max_retry: int = API_MAX_RETRY,
+                 retry_wait: float = API_RETRY_WAIT):
+        self.endpoint   = endpoint
+        self.timeout    = timeout
+        self.max_retry  = max_retry
+        self.retry_wait = retry_wait
+        self._q         = queue.Queue()
+        self._enabled   = _REQUESTS_OK
+
+        if self._enabled:
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            print(f"[API] Push worker started → {endpoint}")
+        else:
+            print("[API] Push worker DISABLED (requests not installed)")
+
+    # ── public interface ─────────────────────────────────────────────────
+
+    def push(self, in_count: int, out_count: int):
+        """Enqueue a payload. Returns immediately — never blocks."""
+        if not self._enabled:
+            return
+        inside  = max(0, in_count - out_count)
+        payload = {
+            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "hin":      in_count,
+            "hout":     out_count,
+            "inside":   inside,
+            "total":    in_count,        # cumulative entries
+        }
+        self._q.put(payload)
+
+    # ── internal worker ──────────────────────────────────────────────────
+
+    def _worker(self):
+        """Runs in a daemon thread. Retries on 5xx, drops on permanent errors."""
+        while True:
+            payload = self._q.get()       # blocks until item available
+            self._send_with_retry(payload)
+            self._q.task_done()
+
+    def _send_with_retry(self, payload: dict):
+        for attempt in range(1, self.max_retry + 2):   # 1 try + max_retry retries
+            try:
+                resp = requests.post(
+                    self.endpoint,
+                    json=payload,
+                    timeout=self.timeout,
+                    headers={"Content-Type": "application/json"},
+                )
+                if resp.status_code < 500:
+                    # 2xx success or 4xx client error — no point retrying
+                    if resp.status_code >= 400:
+                        print(f"[API] Client error {resp.status_code} "
+                              f"for payload {payload} — not retrying")
+                    else:
+                        print(f"[API] ✓ {resp.status_code}  "
+                              f"hin={payload['hin']} hout={payload['hout']} "
+                              f"inside={payload['inside']}")
+                    return
+                # 5xx — eligible for retry
+                print(f"[API] Server error {resp.status_code} "
+                      f"(attempt {attempt}/{self.max_retry + 1})")
+            except requests.exceptions.Timeout:
+                print(f"[API] Timeout (attempt {attempt}/{self.max_retry + 1})")
+            except requests.exceptions.ConnectionError as e:
+                print(f"[API] Connection error (attempt {attempt}): {e}")
+            except Exception as e:
+                print(f"[API] Unexpected error: {e}")
+                return   # non-retriable
+
+            if attempt <= self.max_retry:
+                time.sleep(self.retry_wait)
+
+        print(f"[API] Gave up after {self.max_retry + 1} attempts for payload {payload}")
 
 
 # ═══════════════════════════════════════════════════════
@@ -130,14 +245,24 @@ class BusCounter:
 
     def __init__(self, video_path: str, model_path: str = "yolov8s.pt",
                  output_path: str = "result_v3.mp4",
-                 exempt_path: str = ""):
+                 exempt_path: str = "", no_preview: bool = False, live: bool = False):
         self.video_path  = video_path
         self.output_path = output_path
+        self.no_preview  = no_preview
+        self.live        = live
         self.model       = YOLO(model_path)
         self.states: dict[int, TrackState] = {}
         self.in_count  = 0
         self.out_count = 0
         self.events: list[dict] = []   # for CSV
+
+        # ── Non-blocking API push worker ─────────────────────────────────
+        self.api = ApiPushWorker(
+            endpoint   = API_ENDPOINT,
+            timeout    = API_TIMEOUT,
+            max_retry  = API_MAX_RETRY,
+            retry_wait = API_RETRY_WAIT,
+        )
 
         # ── Exempt person setup ───────────────────────────────────────────
         self.exempt_emb  = None
@@ -217,16 +342,28 @@ class BusCounter:
                               last_seen=frame_no)
 
             # Critical: classify first-seen position
-            if side == "L":
-                st.zone_state = "OUTSIDE"
-                st.prev_side  = "L"
-            elif side == "R":
-                # Already inside — can only count OUT, never IN
-                st.zone_state = "INSIDE"
-                st.prev_side  = "R"
+            if self.live:
+                if side == "L":
+                    st.zone_state = "OUTSIDE"
+                    st.prev_side  = "L"
+                elif side == "R":
+                    st.zone_state = "INSIDE"
+                    st.prev_side  = "R"
+                else:
+                    # Live stream: allow a zone-start track to still count later
+                    st.zone_state = "ZONE"
+                    st.prev_side  = ""
             else:
-                # First seen in dead zone — cannot count in either direction
-                st.zone_state = "SKIP"
+                if side == "L":
+                    st.zone_state = "OUTSIDE"
+                    st.prev_side  = "L"
+                elif side == "R":
+                    # Already inside — can only count OUT, never IN
+                    st.zone_state = "INSIDE"
+                    st.prev_side  = "R"
+                else:
+                    # First seen in dead zone — cannot count in either direction
+                    st.zone_state = "SKIP"
 
             self.states[tid] = st
 
@@ -293,7 +430,7 @@ class BusCounter:
             # Only commit transition after DEBOUNCE_N consecutive frames
             if st.side_frames >= DEBOUNCE_N:
                 if current_side == "L":
-                    if st.zone_state == "ZONE" and st.prev_side == "R":
+                    if (self.live and st.prev_side in ("", "R")) or (not self.live and st.prev_side == "R") and st.zone_state in ("ZONE", "INSIDE"):
                         # Confirmed crossing: INSIDE → ZONE → OUTSIDE  =  EXIT
                         if st.counted != "OUT":
                             self.out_count += 1
@@ -305,11 +442,13 @@ class BusCounter:
                                 "in": self.in_count, "out": self.out_count
                             })
                             print(f"[{frame_no:05d}] ID {tid:3d} LEFT   | IN={self.in_count} OUT={self.out_count}")
+                            # ── Non-blocking API push ────────────────────
+                            self.api.push(self.in_count, self.out_count)
                     st.zone_state = "OUTSIDE"
                     st.prev_side  = "L"
 
                 elif current_side == "R":
-                    if st.zone_state == "ZONE" and st.prev_side == "L":
+                    if (self.live and st.prev_side in ("", "L")) or (not self.live and st.prev_side == "L") and st.zone_state in ("ZONE", "OUTSIDE"):
                         # Confirmed crossing: OUTSIDE → ZONE → INSIDE  =  ENTER
                         if st.counted != "IN":
                             self.in_count += 1
@@ -321,6 +460,8 @@ class BusCounter:
                                 "in": self.in_count, "out": self.out_count
                             })
                             print(f"[{frame_no:05d}] ID {tid:3d} ENTERED| IN={self.in_count} OUT={self.out_count}")
+                            # ── Non-blocking API push ────────────────────
+                            self.api.push(self.in_count, self.out_count)
                     st.zone_state = "INSIDE"
                     st.prev_side  = "R"
 
@@ -547,9 +688,10 @@ class BusCounter:
                 frame = self._draw_dashboard(frame, frame_no, FPS)
                 writer.write(frame)
 
-                cv2.imshow("Bus Counter v3", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+                if not self.no_preview:
+                    cv2.imshow("Bus Counter v3", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
 
         finally:
             cap.release()
@@ -575,7 +717,7 @@ class BusCounter:
 def main():
     global LINE_RATIO
 
-    p = argparse.ArgumentParser(description="Bus Passenger Counter v3")
+    p = argparse.ArgumentParser(description="Bus Passenger Counter v3 + API Push")
     p.add_argument("--source",  default="counting.mp4",   help="Input video")
     p.add_argument("--output",  default="result_v3.mp4",  help="Output video")
     p.add_argument("--model",   default="yolov8s.pt",     help="YOLO weights")
@@ -585,6 +727,8 @@ def main():
                    help="Path to exempt_embedding.npy (skip counting this person)")
     p.add_argument("--no-preview", action="store_true",
                    help="Disable live preview (faster headless runs)")
+    p.add_argument("--live", action="store_true",
+                   help="Live stream mode: assume all tracks start outside")
     args = p.parse_args()
 
     LINE_RATIO = args.line
@@ -594,6 +738,8 @@ def main():
         model_path  = args.model,
         output_path = args.output,
         exempt_path = args.exempt,
+        no_preview  = args.no_preview,
+        live        = args.live,
     )
     counter.process()
 
