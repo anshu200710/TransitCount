@@ -55,15 +55,16 @@ except ImportError:
 # ═══════════════════════════════════════════════════════
 #  CONFIGURATION  — edit these to tune for your scene
 # ═══════════════════════════════════════════════════════
-LINE_RATIO     = 0.50    # Trigger line at 50% frame width
-DEAD_ZONE_PX   = 30      # ±30 px either side of line = 60 px total buffer zone
-DEBOUNCE_N     = 3       # Frames needed on same side to commit to that side
-CONF_THRESH    = 0.10    # Lower for more detections
-IOU_THRESH     = 0.40    # Low — keeps separate boxes for side-by-side people
-TRAIL_LEN      = 50      # Centroid history length per ID
-GHOST_TIMEOUT  = 300     # Purge ID state after this many frames of absence
-FLASH_FRAMES   = 20      # How long the cyan count-flash lasts
-EMA_ALPHA      = 0.60    # Centroid smoothing (0=frozen, 1=raw)
+LINE_RATIO     = 0.45    
+DEAD_ZONE_PX   = 30      
+DEBOUNCE_N     = 3       
+CONF_THRESH    = 0.12    
+IOU_THRESH     = 0.40    
+TRAIL_LEN      = 50      
+GHOST_TIMEOUT  = 150     
+FLASH_FRAMES   = 20      
+EMA_ALPHA      = 0.40    
+BADGE_MIN_PX   = 20
 EXEMPT_THRESH  = 0.70    # Cosine similarity threshold for exempt match
 EXEMPT_SAMPLES = 5       # Frames to collect before deciding exempt status
 
@@ -427,10 +428,15 @@ class BusCounter:
             else:
                 st.side_frames  += 1
 
+
             # Only commit transition after DEBOUNCE_N consecutive frames
             if st.side_frames >= DEBOUNCE_N:
                 if current_side == "L":
-                    if (self.live and st.prev_side in ("", "R")) or (not self.live and st.prev_side == "R") and st.zone_state in ("ZONE", "INSIDE"):
+                    # Fix: clarify logic for live and non-live, and allow zone-start tracks to count if they traverse full path
+                    if (
+                        (self.live and st.zone_state in ("ZONE", "INSIDE") and st.prev_side in ("", "R"))
+                        or (not self.live and st.zone_state in ("ZONE", "INSIDE") and st.prev_side == "R")
+                    ):
                         # Confirmed crossing: INSIDE → ZONE → OUTSIDE  =  EXIT
                         if st.counted != "OUT":
                             self.out_count += 1
@@ -448,7 +454,10 @@ class BusCounter:
                     st.prev_side  = "L"
 
                 elif current_side == "R":
-                    if (self.live and st.prev_side in ("", "L")) or (not self.live and st.prev_side == "L") and st.zone_state in ("ZONE", "OUTSIDE"):
+                    if (
+                        (self.live and st.zone_state in ("ZONE", "OUTSIDE") and st.prev_side in ("", "L"))
+                        or (not self.live and st.zone_state in ("ZONE", "OUTSIDE") and st.prev_side == "L")
+                    ):
                         # Confirmed crossing: OUTSIDE → ZONE → INSIDE  =  ENTER
                         if st.counted != "IN":
                             self.in_count += 1
