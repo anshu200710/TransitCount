@@ -73,7 +73,7 @@ EXEMPT_THRESH   = 0.70   # cosine similarity threshold
 EXEMPT_SAMPLES  = 5      # frames before deciding embed-based exemption
 
 # ── API ───────────────────────────────────────────────────────────────────
-API_ENDPOINT    = "https://bae6-49-205-179-53.ngrok-free.app/passenger-count"
+API_ENDPOINT    = "https://7d90-49-205-176-68.ngrok-free.app/api/passenger-count"
 API_TIMEOUT     = 2
 API_MAX_RETRY   = 2
 API_RETRY_WAIT  = 0.3
