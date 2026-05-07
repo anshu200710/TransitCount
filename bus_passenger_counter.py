@@ -282,10 +282,13 @@ class TrackState:
 # ═══════════════════════════════════════════════════════
 class BusCounter:
     def __init__(self, video_path: str, model_path: str = "yolov8s.pt", output_path: str = "result_v4.mp4",
-                 enable_debug: bool = False, head_detect: bool = False, visdrone: bool = False):
+                 enable_debug: bool = False, head_detect: bool = False, visdrone: bool = False,
+                 no_preview: bool = False, live: bool = False):
         self.video_path  = video_path
         self.output_path = output_path
         self.head_detect = head_detect
+        self.no_preview  = no_preview
+        self.live        = live
 
         # ── Model selection priority: visdrone > head_detect > default ──
         if visdrone:
@@ -825,6 +828,7 @@ class BusCounter:
     def _update_track(self, tid, bbox, line_x, f_no, frame, fps: float = 30.0):
         x1, y1, x2, y2 = bbox.astype(int)
         raw_cx, raw_cy = (x1+x2)/2.0, (y1+y2)/2.0
+        event = None  # Initialize event variable
 
         # Print frame header for better readability
         print(f"\n{'='*80}")
@@ -838,8 +842,9 @@ class BusCounter:
         if tid not in self.states:
             # Still not found — create a genuinely new track
             side = self._get_side(raw_cx, line_x)
+            kf   = KalmanCentroid(raw_cx, raw_cy)
             st   = TrackState(kalman=kf, cx=raw_cx, cy=raw_cy,
-                              last_seen=frame_no)
+                              last_seen=f_no)
 
             # Critical: classify first-seen position
             if self.live:
@@ -975,10 +980,10 @@ class BusCounter:
         side = self._get_side(st.cx, line_x)
         if side == "ZONE": st.zone_state, st.side_frames, st.debounce_side = "ZONE", 0, ""
         else:
-            # current_side is "L" or "R"
+            # side is "L" or "R"
             # ── Debounce: accumulate consecutive frames on this side ──────
-            if st.debounce_side != current_side:
-                st.debounce_side = current_side
+            if st.debounce_side != side:
+                st.debounce_side = side
                 st.side_frames   = 1
             else:
                 st.side_frames  += 1
@@ -986,7 +991,7 @@ class BusCounter:
 
             # Only commit transition after DEBOUNCE_N consecutive frames
             if st.side_frames >= DEBOUNCE_N:
-                if current_side == "L":
+                if side == "L":
                     # Fix: clarify logic for live and non-live, and allow zone-start tracks to count if they traverse full path
                     if (
                         (self.live and st.zone_state in ("ZONE", "INSIDE") and st.prev_side in ("", "R"))
@@ -999,16 +1004,17 @@ class BusCounter:
                             st.flash       = FLASH_FRAMES
                             event          = "OUT"
                             self.events.append({
-                                "frame": frame_no, "id": tid, "event": "OUT",
+                                "frame": f_no, "id": tid, "event": "OUT",
                                 "in": self.in_count, "out": self.out_count
                             })
-                            print(f"[{frame_no:05d}] ID {tid:3d} LEFT   | IN={self.in_count} OUT={self.out_count}")
+                            print(f"[{f_no:05d}] ID {tid:3d} LEFT   | IN={self.in_count} OUT={self.out_count}")
                             # ── Non-blocking API push ────────────────────
-                            self.api.push(self.in_count, self.out_count)
+                            if hasattr(self, 'api'):
+                                self.api.push(self.in_count, self.out_count)
                     st.zone_state = "OUTSIDE"
                     st.prev_side  = "L"
 
-                elif current_side == "R":
+                elif side == "R":
                     if (
                         (self.live and st.zone_state in ("ZONE", "OUTSIDE") and st.prev_side in ("", "L"))
                         or (not self.live and st.zone_state in ("ZONE", "OUTSIDE") and st.prev_side == "L")
@@ -1020,12 +1026,13 @@ class BusCounter:
                             st.flash      = FLASH_FRAMES
                             event         = "IN"
                             self.events.append({
-                                "frame": frame_no, "id": tid, "event": "IN",
+                                "frame": f_no, "id": tid, "event": "IN",
                                 "in": self.in_count, "out": self.out_count
                             })
-                            print(f"[{frame_no:05d}] ID {tid:3d} ENTERED| IN={self.in_count} OUT={self.out_count}")
+                            print(f"[{f_no:05d}] ID {tid:3d} ENTERED| IN={self.in_count} OUT={self.out_count}")
                             # ── Non-blocking API push ────────────────────
-                            self.api.push(self.in_count, self.out_count)
+                            if hasattr(self, 'api'):
+                                self.api.push(self.in_count, self.out_count)
                     st.zone_state = "INSIDE"
                     st.prev_side  = "R"
 
@@ -1209,6 +1216,15 @@ class BusCounter:
                 track_args["classes"] = [0]
 
             res = self.model.track(frame, **track_args)[0]
+            
+            # Convert results to supervision Detections for drawing
+            dets = sv.Detections(
+                xyxy=res.boxes.xyxy.cpu().numpy(),
+                confidence=res.boxes.conf.cpu().numpy() if res.boxes.conf is not None else None,
+                class_id=res.boxes.cls.cpu().numpy().astype(int) if res.boxes.cls is not None else None,
+                tracker_id=res.boxes.id.cpu().numpy().astype(int) if res.boxes.id is not None else None,
+            )
+            
             if res.boxes.id is not None:
                 for b, tid in zip(res.boxes.xyxy.cpu().numpy(),
                                   res.boxes.id.cpu().numpy().astype(int)):
@@ -1231,16 +1247,16 @@ class BusCounter:
                     if f_no - g_st.last_seen < GHOST_TIMEOUT * 2
                 }
 
-                # ── Draw ──────────────────────────────────────────────────
-                frame = self._draw_zones(frame, line_x)
-                frame = self._draw_tracks(frame, dets)
-                frame = self._draw_dashboard(frame, frame_no, FPS)
-                writer.write(frame)
+            # ── Draw ──────────────────────────────────────────────────
+            frame = self._draw_zones(frame, line_x)
+            frame = self._draw_tracks(frame, dets)
+            frame = self._draw_dashboard(frame, f_no, FPS)
+            writer.write(frame)
 
-                if not self.no_preview:
-                    cv2.imshow("Bus Counter v3", frame)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
+            if not self.no_preview:
+                cv2.imshow("Bus Counter v3", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
 
         cap.release()
         writer.release()
@@ -1312,17 +1328,25 @@ def main():
                    help="Disable live preview (faster headless runs)")
     p.add_argument("--live", action="store_true",
                    help="Live stream mode: assume all tracks start outside")
+    p.add_argument("--debug", action="store_true",
+                   help="Enable detailed HSV debugging (saves CSV + images)")
+    p.add_argument("--head-detect", action="store_true",
+                   help="Use CrowdHuman head detection model (better for top-down views)")
+    p.add_argument("--visdrone", action="store_true",
+                   help="Use VisDrone model (optimized for overhead/drone camera views)")
     args = p.parse_args()
 
     LINE_RATIO = args.line
 
     counter = BusCounter(
-        video_path  = args.source,
-        model_path  = args.model,
-        output_path = args.output,
-        exempt_path = args.exempt,
-        no_preview  = args.no_preview,
-        live        = args.live,
+        video_path   = args.source,
+        model_path   = args.model,
+        output_path  = args.output,
+        enable_debug = args.debug,
+        head_detect  = args.head_detect,
+        visdrone     = args.visdrone,
+        no_preview   = args.no_preview,
+        live         = args.live,
     )
     counter.process()
 
