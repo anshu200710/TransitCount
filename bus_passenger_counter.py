@@ -894,6 +894,7 @@ if __name__ == "__main__":
     p.add_argument("--debug",      action="store_true",   help="Enable detailed HSV debugging (saves CSV + images)")
     p.add_argument("--head-detect",action="store_true",   help="Use CrowdHuman-trained model for head/partial body detection")
     p.add_argument("--visdrone",   action="store_true",   help="Auto-download and use VisDrone-pretrained YOLOv8n (best for top-down views)")
+    p.add_argument("--live",       action="store_true",   help="Enable live mode (no effect yet)")
     args = p.parse_args()
     BusCounter(
         args.source,
@@ -902,4 +903,5 @@ if __name__ == "__main__":
         enable_debug = args.debug,
         head_detect  = args.head_detect,
         visdrone     = args.visdrone,
+        # Accept --live, but do nothing with it for now
     ).process()
