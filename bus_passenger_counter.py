@@ -1,15 +1,30 @@
 #!/usr/bin/env python3
 """
-Bus Passenger Counter — v4.0 TOP-DOWN TRACKING + BYTETRACK + VISDRONE
-=======================================================================
-Key improvements over v3.7:
-  • VisDrone-pretrained YOLO model auto-downloaded for top-down head detection
-  • ByteTrack replaces BoT-SORT — better track recovery on low-confidence frames
-  • Kalman process noise tuned for faster overhead movement
-  • Position-based ghost re-linking: lost tracks re-adopted by proximity before
-    a new ID is assigned, eliminating the "new ID for the same person" problem
-  • GHOST_TIMEOUT raised so occluded people are not dropped prematurely
-  • CONF_THRESH lowered for top-down small-head detections
+Bus Passenger Counter — v3 DEFINITIVE + API Push
+==================================================
+Camera: overhead/top-down at bus front gate
+Direction: passengers move LEFT → RIGHT to enter, RIGHT → LEFT to exit
+
+All confirmed bugs from video analysis fixed:
+  ✓ Line moved to 50% width (was 38% — too early to init ID)
+  ✓ "???IN" ghost counts fixed — IDs first seen inside dead zone are SKIPPED
+  ✓ IDs first seen on RIGHT side (already inside bus) cannot trigger IN count
+  ✓ Proper 3-state machine: OUTSIDE → ZONE → INSIDE (must traverse all 3)
+  ✓ Kalman Filter per track for smooth centroid prediction during occlusion
+  ✓ conf=0.12, iou=0.40 — separates shoulder-to-shoulder passengers
+  ✓ ByteTrack: buffer=150 frames (5s), low activation threshold
+  ✓ CYAN flash on confirmed count (auditable in real-time)
+  ✓ Trail lines with age-based color gradient
+  ✓ Ghost ID cleanup every 90 frames
+  ✓ CSV logs every event with frame + timestamp
+  ✓ agnostic_nms=True prevents class-merging of overlapping detections
+
+API Push additions (v3.1):
+  ✓ Non-blocking POST via background thread + queue (zero FPS impact)
+  ✓ Payload: {datetime, hin, hout, inside, total}
+  ✓ 2-second request timeout — network hangs never stall the main loop
+  ✓ Max 2 retries on 5xx errors with short back-off
+  ✓ Triggered only on confirmed IN/OUT transitions (no duplicate calls)
 """
 
 import cv2
@@ -21,6 +36,21 @@ from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime
 import csv, os, argparse
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+
+# ── NEW: non-blocking API push imports ──────────────────────────────────
+import threading
+import queue
+import time
+try:
+    import requests
+    _REQUESTS_OK = True
+except ImportError:
+    _REQUESTS_OK = False
+    print("[WARN] 'requests' library not found. API push disabled. "
+          "Install with: pip install requests")
 
 # ═══════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -56,6 +86,14 @@ RELINK_MAX_AGE   = 45    # Ghost must have been seen within this many frames
 
 # ByteTrack tracker config (written at runtime if missing)
 TRACKER_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bytetrack.yaml")
+# ── API configuration ────────────────────────────────────────────────────
+API_ENDPOINT   = "https://bae6-49-205-179-53.ngrok-free.app/passenger-count"
+API_TIMEOUT    = 2        # seconds — never block processing loop
+API_MAX_RETRY  = 2        # retries on 5xx errors
+API_RETRY_WAIT = 0.3      # seconds between retries
+
+# BoT-SORT tracker config (see botsort.yaml for full settings)
+TRACKER_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botsort.yaml")
 
 # Colours (BGR)
 COL_LINE      = (0,  0,   220)
@@ -87,7 +125,102 @@ class TrackState:
     tape_votes:  deque = field(default_factory=lambda: deque(maxlen=VOTE_WINDOW))
     consec_miss: int   = 0  # Consecutive non-blurry frames where tape was NOT detected
 
+# ═══════════════════════════════════════════════════════
+#  NON-BLOCKING API WORKER
+# ═══════════════════════════════════════════════════════
+
+class ApiPushWorker:
+    """
+    Background daemon thread that drains a queue and fires POST requests.
+
+    The main video loop enqueues a payload dict and returns immediately —
+    network latency or retries never touch the processing thread.
+    """
+
+    def __init__(self, endpoint: str, timeout: int = API_TIMEOUT,
+                 max_retry: int = API_MAX_RETRY,
+                 retry_wait: float = API_RETRY_WAIT):
+        self.endpoint   = endpoint
+        self.timeout    = timeout
+        self.max_retry  = max_retry
+        self.retry_wait = retry_wait
+        self._q         = queue.Queue()
+        self._enabled   = _REQUESTS_OK
+
+        if self._enabled:
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            print(f"[API] Push worker started → {endpoint}")
+        else:
+            print("[API] Push worker DISABLED (requests not installed)")
+
+    # ── public interface ─────────────────────────────────────────────────
+
+    def push(self, in_count: int, out_count: int):
+        """Enqueue a payload. Returns immediately — never blocks."""
+        if not self._enabled:
+            return
+        inside  = max(0, in_count - out_count)
+        payload = {
+            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "hin":      in_count,
+            "hout":     out_count,
+            "inside":   inside,
+            "total":    in_count,        # cumulative entries
+        }
+        self._q.put(payload)
+
+    # ── internal worker ──────────────────────────────────────────────────
+
+    def _worker(self):
+        """Runs in a daemon thread. Retries on 5xx, drops on permanent errors."""
+        while True:
+            payload = self._q.get()       # blocks until item available
+            self._send_with_retry(payload)
+            self._q.task_done()
+
+    def _send_with_retry(self, payload: dict):
+        for attempt in range(1, self.max_retry + 2):   # 1 try + max_retry retries
+            try:
+                resp = requests.post(
+                    self.endpoint,
+                    json=payload,
+                    timeout=self.timeout,
+                    headers={"Content-Type": "application/json"},
+                )
+                if resp.status_code < 500:
+                    # 2xx success or 4xx client error — no point retrying
+                    if resp.status_code >= 400:
+                        print(f"[API] Client error {resp.status_code} "
+                              f"for payload {payload} — not retrying")
+                    else:
+                        print(f"[API] ✓ {resp.status_code}  "
+                              f"hin={payload['hin']} hout={payload['hout']} "
+                              f"inside={payload['inside']}")
+                    return
+                # 5xx — eligible for retry
+                print(f"[API] Server error {resp.status_code} "
+                      f"(attempt {attempt}/{self.max_retry + 1})")
+            except requests.exceptions.Timeout:
+                print(f"[API] Timeout (attempt {attempt}/{self.max_retry + 1})")
+            except requests.exceptions.ConnectionError as e:
+                print(f"[API] Connection error (attempt {attempt}): {e}")
+            except Exception as e:
+                print(f"[API] Unexpected error: {e}")
+                return   # non-retriable
+
+            if attempt <= self.max_retry:
+                time.sleep(self.retry_wait)
+
+        print(f"[API] Gave up after {self.max_retry + 1} attempts for payload {payload}")
+
+
+# ═══════════════════════════════════════════════════════
+#  KALMAN FILTER  — 4-state: [cx, cy, vx, vy]
+# ═══════════════════════════════════════════════════════
 class KalmanCentroid:
+    """Constant-velocity Kalman filter for centroid smoothing."""
+
     def __init__(self, cx: float, cy: float):
         self.kf = cv2.KalmanFilter(4, 2)
         self.kf.measurementMatrix   = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
@@ -110,6 +243,43 @@ class KalmanCentroid:
         pred = self.kf.predict()
         return float(pred[0, 0]), float(pred[1, 0])
 
+
+# ═══════════════════════════════════════════════════════
+#  PER-TRACK STATE MACHINE
+# ═══════════════════════════════════════════════════════
+@dataclass
+class TrackState:
+    """
+    3-state crossing machine per track ID.
+
+    States:
+      OUTSIDE  — centroid firmly on the LEFT of dead zone  (entry side)
+      ZONE     — centroid inside the dead zone             (crossing)
+      INSIDE   — centroid firmly on the RIGHT              (bus interior)
+
+    Valid counting transition:  OUTSIDE → ZONE → INSIDE  (+1 IN)
+    Valid exit transition:      INSIDE  → ZONE → OUTSIDE  (+1 OUT)
+    Invalid (skip):             ID first seen in ZONE or INSIDE
+    """
+    kalman:      KalmanCentroid
+    cx:          float            # smoothed centroid x
+    cy:          float            # smoothed centroid y
+    trail:       deque = field(default_factory=lambda: deque(maxlen=TRAIL_LEN))
+    zone_state:  str  = "INIT"   # INIT | OUTSIDE | ZONE | INSIDE | SKIP
+    counted:     Optional[str] = None   # None | 'IN' | 'OUT'
+    flash:       int  = 0
+    last_seen:   int  = 0
+    side_frames: int  = 0        # consecutive frames on current confirmed side
+    prev_side:   str  = ""       # last confirmed non-ZONE side
+    debounce_side: str = ""      # which side we are accumulating debounce for
+    exempt:      bool = False    # True if matched as exempt person
+    embed_crops: list = field(default_factory=list)   # crops for embedding
+    embed_done:  bool = False    # True after exemption check is complete
+
+
+# ═══════════════════════════════════════════════════════
+#  MAIN COUNTER CLASS
+# ═══════════════════════════════════════════════════════
 class BusCounter:
     def __init__(self, video_path: str, model_path: str = "yolov8s.pt", output_path: str = "result_v4.mp4",
                  enable_debug: bool = False, head_detect: bool = False, visdrone: bool = False):
@@ -192,6 +362,32 @@ class BusCounter:
         in a tentative pool — this dramatically reduces ID switches when a person
         is briefly occluded or the model confidence drops due to overhead angle.
 
+        # ── Non-blocking API push worker ─────────────────────────────────
+        self.api = ApiPushWorker(
+            endpoint   = API_ENDPOINT,
+            timeout    = API_TIMEOUT,
+            max_retry  = API_MAX_RETRY,
+            retry_wait = API_RETRY_WAIT,
+        )
+
+        # ── Exempt person setup ───────────────────────────────────────────
+        self.exempt_emb  = None
+        self.feat_model  = None
+        if exempt_path and os.path.isfile(exempt_path):
+            self.exempt_emb = np.load(exempt_path)
+            print(f"Loaded exempt embedding from {exempt_path}")
+            # MobileNetV2 feature extractor (same as enroll_exempt.py)
+            net = models.mobilenet_v2(weights="DEFAULT")
+            net.classifier = nn.Identity()
+            net.eval()
+            self.feat_model = net
+            self.feat_tfm   = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225]),
+            ])
         Key differences from BoT-SORT defaults:
           • track_high_thresh lowered  → catches partial/head-only detections
           • track_low_thresh  lowered  → second-stage catches even weak hits
@@ -323,7 +519,7 @@ class BusCounter:
         else:
             print(f"     ⚫ Shoulder too dark (no bright pixels)")
             print(f"     🟡 Yellow Pixels:  {yellow_px}px (need {RADIUM_MIN_PX}px minimum)")
-        
+
         # Initialize debug data if debugging enabled
         debug_data = None
         if self.enable_debug:
@@ -338,7 +534,7 @@ class BusCounter:
                 'shoulder_roi_bottom_pct':0.60,
                 'shoulder_yellow_pixels': yellow_px,
             }
-        
+
         # Require minimum pixels for valid radium tape detection
         if yellow_px >= RADIUM_MIN_PX:
             # Calculate mean saturation and value for validation
@@ -347,19 +543,19 @@ class BusCounter:
                 h_vals = shoulder_roi[:,:,0][mask_yellow > 0]
                 s_vals = shoulder_roi[:,:,1][mask_yellow > 0]
                 v_vals = shoulder_roi[:,:,2][mask_yellow > 0]
-                
+
                 max_s = int(np.max(s_vals))
                 max_v = int(np.max(v_vals))
                 mean_h = float(np.mean(h_vals))
                 mean_s = float(np.mean(s_vals))
                 mean_v = float(np.mean(v_vals))
-                
+
                 print(f"\n     📊 Yellow Region Analysis:")
                 print(f"        Hue (H):        mean={mean_h:5.1f}")
                 print(f"        Saturation (S): mean={mean_s:5.1f}, max={max_s:3d}")
                 print(f"        Value (V):      mean={mean_v:5.1f}, max={max_v:3d}")
                 print(f"\n     🔍 Validation Checks:")
-                
+
                 # Enhanced debug logging
                 if self.enable_debug and debug_data is not None:
                     debug_data.update({
@@ -381,7 +577,7 @@ class BusCounter:
                     # Pass roi_top so _save_debug_image can draw the correct ROI box
                     self._save_debug_image(crop_clean, hsv, mask_yellow,
                                            debug_data, tid, frame_no, roi_top)
-                
+
                 # Validate it's bright enough (not shadows or dark objects)
                 if max_v < 150:
                     print(f"        ❌ Brightness Check: FAILED (V={max_v} < 150)")
@@ -398,9 +594,9 @@ class BusCounter:
                         })
                         self.debug_log.append(debug_data)
                     return False
-                
+
                 print(f"        ✅ Brightness Check: PASSED (V={max_v} >= 150)")
-                
+
                 # Validate peak saturation — must have some bright pixels
                 if max_s < 150:
                     print(f"        ❌ Peak Saturation Check: FAILED (S={max_s} < 150)")
@@ -417,16 +613,16 @@ class BusCounter:
                         })
                         self.debug_log.append(debug_data)
                     return False
-                
+
                 print(f"        ✅ Peak Saturation Check: PASSED (S={max_s} >= 150)")
-                
+
                 # Adaptive mean saturation threshold based on pixel count
                 # Small area (300-2000px) = likely tape → lenient threshold (mean_s >= 45)
                 # Large area (2000+px) = likely clothing → strict threshold (mean_s >= 75)
                 if yellow_px > 2000:
                     mean_s_threshold = 75
                     area_type = "large"
-                    
+
                     # Additional check for large areas: max_s must be consistently high
                     # Real tape + clothing: max_s >= 160 (tape is bright)
                     # Pure clothing: max_s < 160 (no bright tape pixels)
@@ -445,15 +641,15 @@ class BusCounter:
                             })
                             self.debug_log.append(debug_data)
                         return False
-                    
+
                     print(f"        ✅ Large Area Brightness Check: PASSED (max_s={max_s} >= 160)")
                 else:
                     mean_s_threshold = 45
                     area_type = "small"
-                
+
                 print(f"        📏 Area Classification: {area_type.upper()} ({yellow_px}px)")
                 print(f"           → Threshold: mean_s >= {mean_s_threshold}")
-                
+
                 if mean_s < mean_s_threshold:
                     print(f"        ❌ Mean Saturation Check: FAILED (mean_s={mean_s:.1f} < {mean_s_threshold})")
                     print(f"           → Likely yellow clothing, not radium tape")
@@ -469,7 +665,7 @@ class BusCounter:
                         })
                         self.debug_log.append(debug_data)
                     return False
-                
+
                 print(f"        ✅ Mean Saturation Check: PASSED (mean_s={mean_s:.1f} >= {mean_s_threshold})")
                 print(f"\n     ✅ ALL CHECKS PASSED → RADIUM TAPE DETECTED!")
                 print(f"\n{'🟢'*40}")
@@ -485,7 +681,7 @@ class BusCounter:
                     else:
                         adaptive_threshold = 45
                         area_class = "small"
-                    
+
                     debug_data.update({
                         'meets_brightness_threshold': True,
                         'meets_saturation_threshold': True,
@@ -517,7 +713,7 @@ class BusCounter:
                     for stat in ['min', 'max', 'mean', 'std']:
                         debug_data[f'shoulder_{key}_{stat}'] = 0
                 self.debug_log.append(debug_data)
-        
+
         return False
 
     def _save_debug_image(self, crop: np.ndarray, hsv: np.ndarray, mask_yellow: np.ndarray,
@@ -556,7 +752,7 @@ class BusCounter:
         canvas[crop_h:2 * crop_h, 0:crop_w]              = h_vis
         canvas[crop_h:2 * crop_h, crop_w:2 * crop_w]     = s_vis
         canvas[crop_h:2 * crop_h, 2 * crop_w:3 * crop_w] = v_vis
-        
+
         # Labels
         labels = [
             (10,              20,           "Original"),
@@ -629,12 +825,12 @@ class BusCounter:
     def _update_track(self, tid, bbox, line_x, f_no, frame, fps: float = 30.0):
         x1, y1, x2, y2 = bbox.astype(int)
         raw_cx, raw_cy = (x1+x2)/2.0, (y1+y2)/2.0
-        
+
         # Print frame header for better readability
         print(f"\n{'='*80}")
         print(f"  FRAME {f_no:05d} | ID {tid:2d} | Timestamp: {f_no/fps:.2f}s")
         print(f"{'='*80}")
-        
+
         if tid not in self.states:
             # ── Ghost re-link: try to recover a recently-lost track ───
             self._relink_ghost(tid, raw_cx, raw_cy, f_no)
@@ -642,11 +838,35 @@ class BusCounter:
         if tid not in self.states:
             # Still not found — create a genuinely new track
             side = self._get_side(raw_cx, line_x)
-            st   = TrackState(kalman=KalmanCentroid(raw_cx, raw_cy), cx=raw_cx, cy=raw_cy, last_seen=f_no)
-            if side == "L":   st.zone_state, st.prev_side = "OUTSIDE", "L"
-            elif side == "R": st.zone_state, st.prev_side = "INSIDE",  "R"
-            else:             st.zone_state = "SKIP"
+            st   = TrackState(kalman=kf, cx=raw_cx, cy=raw_cy,
+                              last_seen=frame_no)
+
+            # Critical: classify first-seen position
+            if self.live:
+                if side == "L":
+                    st.zone_state = "OUTSIDE"
+                    st.prev_side  = "L"
+                elif side == "R":
+                    st.zone_state = "INSIDE"
+                    st.prev_side  = "R"
+                else:
+                    # Live stream: allow a zone-start track to still count later
+                    st.zone_state = "ZONE"
+                    st.prev_side  = ""
+            else:
+                if side == "L":
+                    st.zone_state = "OUTSIDE"
+                    st.prev_side  = "L"
+                elif side == "R":
+                    # Already inside — can only count OUT, never IN
+                    st.zone_state = "INSIDE"
+                    st.prev_side  = "R"
+                else:
+                    # First seen in dead zone — cannot count in either direction
+                    st.zone_state = "SKIP"
+
             self.states[tid] = st
+
         st = self.states[tid]
         st.last_seen = f_no
         st.last_bbox = (x1, y1, x2, y2)
@@ -658,11 +878,11 @@ class BusCounter:
         overlapping = self._overlaps_other_tracks(tid, (x1, y1, x2, y2), f_no)
         tape_found = False
         skip_reason = ""
-        
+
         # Print bounding box info
         print(f"  📦 Bounding Box: {w_box:3d}x{h_box:3d} | Aspect Ratio: {ar:.2f}")
         print(f"  📍 Position: ({x1}, {y1}) → ({x2}, {y2})")
-        
+
         if merged:
             skip_reason = "MERGED"
             print(f"  ⚠️  Status: MERGED BOX (AR > {MERGE_AR_THRESH}) - Skipping tape detection")
@@ -704,7 +924,7 @@ class BusCounter:
                     else:
                         print(f"  ❌ NO TAPE — consec miss {st.consec_miss}/{HYSTERESIS_MISS} "
                               f"(score held) | Votes: {vote_hits}/{len(st.tape_votes)}")
-        
+
         # When merged/overlapping: score unchanged — don't penalize or reward
         prev_exempt = st.exempt
 
@@ -715,12 +935,12 @@ class BusCounter:
             st.exempt = True
         elif st.exempt_score == 0 and st.consec_miss >= HYSTERESIS_MISS:
             st.exempt = False
-        
+
         # Print exemption status
         print(f"\n  📊 EXEMPTION STATUS:")
         print(f"     Current Score: {st.exempt_score:2d}/{EXEMPT_CONFIRM} (max: {EXEMPT_MAX})")
         print(f"     Exempt: {'YES ✓' if st.exempt else 'NO ✗'}")
-        
+
         if st.exempt and not prev_exempt:
             print(f"\n{'⭐'*40}")
             print(f"  🎉 🎉 🎉 [EXEMPT GRANTED] 🎉 🎉 🎉")
@@ -731,16 +951,16 @@ class BusCounter:
             print(f"\n{'⚠️ '*40}")
             print(f"  ⚠️  [EXEMPT REVOKED] ID {tid} (score={st.exempt_score})")
             print(f"{'⚠️ '*40}\n")
-        
+
         print(f"{'='*80}\n")
 
         pcx, pcy = st.kalman.update(raw_cx, raw_cy)
         st.cx, st.cy = EMA_ALPHA * raw_cx + (1-EMA_ALPHA) * pcx, EMA_ALPHA * raw_cy + (1-EMA_ALPHA) * pcy
         st.trail.append((int(st.cx), int(st.cy)))
         if st.flash > 0: st.flash -= 1
-        
+
         if st.exempt: return
-        
+
         # SKIP recovery: if track was born in dead zone, recover once it moves to a clear side
         if st.zone_state == "SKIP":
             side = self._get_side(st.cx, line_x)
@@ -755,30 +975,214 @@ class BusCounter:
         side = self._get_side(st.cx, line_x)
         if side == "ZONE": st.zone_state, st.side_frames, st.debounce_side = "ZONE", 0, ""
         else:
-            if st.debounce_side != side: st.debounce_side, st.side_frames = side, 1
-            else: st.side_frames += 1
+            # current_side is "L" or "R"
+            # ── Debounce: accumulate consecutive frames on this side ──────
+            if st.debounce_side != current_side:
+                st.debounce_side = current_side
+                st.side_frames   = 1
+            else:
+                st.side_frames  += 1
+
+
+            # Only commit transition after DEBOUNCE_N consecutive frames
             if st.side_frames >= DEBOUNCE_N:
-                if side == "L" and st.zone_state == "ZONE" and st.prev_side == "R":
-                    if st.counted != "OUT":
-                        self.out_count += 1
-                        st.counted, st.flash = "OUT", FLASH_FRAMES
-                        self.events.append({"frame": f_no, "id": tid, "event": "OUT", "in": self.in_count, "out": self.out_count})
-                        print(f"\n{'🚪'*40}")
-                        print(f"  🚶 PERSON LEFT THE BUS")
-                        print(f"     ID: {tid} | Frame: {f_no:05d} | Time: {f_no/fps:.2f}s")
-                        print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
-                        print(f"{'🚪'*40}\n")
-                elif side == "R" and st.zone_state == "ZONE" and st.prev_side == "L":
-                    if st.counted != "IN":
-                        self.in_count += 1
-                        st.counted, st.flash = "IN", FLASH_FRAMES
-                        self.events.append({"frame": f_no, "id": tid, "event": "IN", "in": self.in_count, "out": self.out_count})
-                        print(f"\n{'🚪'*40}")
-                        print(f"  🚶 PERSON ENTERED THE BUS")
-                        print(f"     ID: {tid} | Frame: {f_no:05d} | Time: {f_no/fps:.2f}s")
-                        print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
-                        print(f"{'🚪'*40}\n")
-                st.zone_state, st.prev_side = ("OUTSIDE" if side=="L" else "INSIDE"), side
+                if current_side == "L":
+                    # Fix: clarify logic for live and non-live, and allow zone-start tracks to count if they traverse full path
+                    if (
+                        (self.live and st.zone_state in ("ZONE", "INSIDE") and st.prev_side in ("", "R"))
+                        or (not self.live and st.zone_state in ("ZONE", "INSIDE") and st.prev_side == "R")
+                    ):
+                        # Confirmed crossing: INSIDE → ZONE → OUTSIDE  =  EXIT
+                        if st.counted != "OUT":
+                            self.out_count += 1
+                            st.counted     = "OUT"
+                            st.flash       = FLASH_FRAMES
+                            event          = "OUT"
+                            self.events.append({
+                                "frame": frame_no, "id": tid, "event": "OUT",
+                                "in": self.in_count, "out": self.out_count
+                            })
+                            print(f"[{frame_no:05d}] ID {tid:3d} LEFT   | IN={self.in_count} OUT={self.out_count}")
+                            # ── Non-blocking API push ────────────────────
+                            self.api.push(self.in_count, self.out_count)
+                    st.zone_state = "OUTSIDE"
+                    st.prev_side  = "L"
+
+                elif current_side == "R":
+                    if (
+                        (self.live and st.zone_state in ("ZONE", "OUTSIDE") and st.prev_side in ("", "L"))
+                        or (not self.live and st.zone_state in ("ZONE", "OUTSIDE") and st.prev_side == "L")
+                    ):
+                        # Confirmed crossing: OUTSIDE → ZONE → INSIDE  =  ENTER
+                        if st.counted != "IN":
+                            self.in_count += 1
+                            st.counted    = "IN"
+                            st.flash      = FLASH_FRAMES
+                            event         = "IN"
+                            self.events.append({
+                                "frame": frame_no, "id": tid, "event": "IN",
+                                "in": self.in_count, "out": self.out_count
+                            })
+                            print(f"[{frame_no:05d}] ID {tid:3d} ENTERED| IN={self.in_count} OUT={self.out_count}")
+                            # ── Non-blocking API push ────────────────────
+                            self.api.push(self.in_count, self.out_count)
+                    st.zone_state = "INSIDE"
+                    st.prev_side  = "R"
+
+        return event
+
+    # ── drawing ───────────────────────────────────────────────────────────
+
+    def _draw_zones(self, frame: np.ndarray, line_x: int) -> np.ndarray:
+        h = frame.shape[0]
+        ov = frame.copy()
+
+        # Left zone (outside) — very subtle blue tint
+        cv2.rectangle(ov, (0, 0), (line_x - DEAD_ZONE_PX, h), (180, 60, 0), -1)
+        # Right zone (inside bus) — very subtle green tint
+        cv2.rectangle(ov, (line_x + DEAD_ZONE_PX, 0), (frame.shape[1], h), (0, 140, 0), -1)
+        frame = cv2.addWeighted(ov, 0.06, frame, 0.94, 0)
+
+        # Dead zone strip — yellow tint
+        ov2 = frame.copy()
+        cv2.rectangle(ov2, (line_x - DEAD_ZONE_PX, 0),
+                      (line_x + DEAD_ZONE_PX, h), (0, 200, 255), -1)
+        frame = cv2.addWeighted(ov2, 0.18, frame, 0.82, 0)
+
+        # Lines
+        cv2.line(frame, (line_x, 0), (line_x, h), COL_LINE, 2)
+        cv2.line(frame, (line_x - DEAD_ZONE_PX, 0),
+                 (line_x - DEAD_ZONE_PX, h), (0, 180, 255), 1)
+        cv2.line(frame, (line_x + DEAD_ZONE_PX, 0),
+                 (line_x + DEAD_ZONE_PX, h), (0, 180, 255), 1)
+
+        # Labels
+        cv2.putText(frame, "OUTSIDE", (10, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, "INSIDE", (line_x + DEAD_ZONE_PX + 6, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 255, 80), 1, cv2.LINE_AA)
+        cv2.putText(frame, "ZONE", (line_x - DEAD_ZONE_PX + 4, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1, cv2.LINE_AA)
+        return frame
+
+    def _draw_tracks(self, frame: np.ndarray, dets: sv.Detections) -> np.ndarray:
+        if dets.tracker_id is None:
+            return frame
+
+        for bbox, tid in zip(dets.xyxy, dets.tracker_id):
+            tid = int(tid)
+            st  = self.states.get(tid)
+            if st is None:
+                continue
+
+            x1, y1, x2, y2 = bbox.astype(int)
+
+            # ── Trail ─────────────────────────────────────────────────────
+            pts = list(st.trail)
+            if len(pts) > 1:
+                for j in range(1, len(pts)):
+                    t     = j / max(len(pts) - 1, 1)
+                    blue  = int(255 * (1 - t))
+                    green = int(200 * t)
+                    red   = int(120 * t)
+                    cv2.line(frame, pts[j-1], pts[j], (blue, green, red), 2,
+                             cv2.LINE_AA)
+
+            # ── Bounding box color ─────────────────────────────────────────
+            if st.exempt:
+                col = COL_EXEMPT
+            elif st.zone_state == "SKIP":
+                col = COL_BOX_SKIP
+            elif st.flash > 0:
+                col = COL_BOX_FLASH      # CYAN on count event
+            else:
+                col = COL_BOX_NORM       # Orange normally
+
+            thick = 3 if st.flash > 0 else 2
+            cv2.rectangle(frame, (x1, y1), (x2, y2), col, thick)
+
+            # ── Centroid dot ───────────────────────────────────────────────
+            cx, cy = int(st.cx), int(st.cy)
+            cv2.circle(frame, (cx, cy), 5, (255, 255, 255), -1)
+            cv2.circle(frame, (cx, cy), 5, col, 2)
+
+            # ── Label ─────────────────────────────────────────────────────
+            if st.exempt:
+                tag_col = COL_EXEMPT
+                tag     = f"#{tid} EXEMPT"
+            elif st.counted == "IN":
+                tag_col = COL_IN_TEXT
+                tag     = f"#{tid} IN"
+            elif st.counted == "OUT":
+                tag_col = COL_OUT_TEXT
+                tag     = f"#{tid} OUT"
+            elif st.zone_state == "SKIP":
+                tag_col = COL_BOX_SKIP
+                tag     = f"#{tid} skip"
+            else:
+                tag_col = (200, 200, 200)
+                tag     = f"#{tid} {st.zone_state[:3]}"
+
+            cv2.putText(frame, tag, (x1, y1 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, tag_col, 1, cv2.LINE_AA)
+
+        return frame
+
+    def _draw_dashboard(self, frame: np.ndarray, frame_no: int,
+                        fps: float) -> np.ndarray:
+        h, w   = frame.shape[:2]
+        dw, dh = 220, 130
+        margin = 14
+        x1 = w - dw - margin
+        y1 = margin
+
+        ov = frame.copy()
+        cv2.rectangle(ov, (x1, y1), (x1 + dw, y1 + dh), (12, 12, 12), -1)
+        frame = cv2.addWeighted(ov, 0.70, frame, 0.30, 0)
+
+        # Green accent bar
+        cv2.rectangle(frame, (x1, y1), (x1 + dw, y1 + 3), (0, 200, 80), -1)
+
+        inside = max(0, self.in_count - self.out_count)
+        rows   = [
+            ("ENTERED", self.in_count,  COL_IN_TEXT),
+            ("LEFT",    self.out_count, COL_OUT_TEXT),
+            ("INSIDE",  inside,         (80, 220, 255)),
+        ]
+        for i, (label, val, col) in enumerate(rows):
+            y = y1 + 34 + i * 32
+            cv2.putText(frame, f"{label}:", (x1 + 10, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (160, 160, 160), 1, cv2.LINE_AA)
+            cv2.putText(frame, str(val), (x1 + 148, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.62, col, 2, cv2.LINE_AA)
+
+        # Frame counter
+        ts = f"f{frame_no}  {frame_no/fps:.1f}s"
+        cv2.putText(frame, ts, (x1 + 10, y1 + dh - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (80, 80, 80), 1, cv2.LINE_AA)
+        return frame
+
+    # ── CSV ───────────────────────────────────────────────────────────────
+
+    def _save_csv(self, path: str):
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["frame", "timestamp", "id",
+                                               "event", "in", "out", "inside"])
+            w.writeheader()
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for ev in self.events:
+                w.writerow({
+                    "frame":     ev["frame"],
+                    "timestamp": ts,
+                    "id":        ev["id"],
+                    "event":     ev["event"],
+                    "in":        ev["in"],
+                    "out":       ev["out"],
+                    "inside":    ev["in"] - ev["out"],
+                })
+        print(f"CSV saved: {path}")
+
+    # ── main loop ─────────────────────────────────────────────────────────
 
     def process(self):
         cap = cv2.VideoCapture(self.video_path)
@@ -827,12 +1231,16 @@ class BusCounter:
                     if f_no - g_st.last_seen < GHOST_TIMEOUT * 2
                 }
 
-            # Draw UI and write frame
-            frame = self._draw_ui(frame, line_x, res)
-            writer.write(frame)
-            cv2.imshow("Bus Counter", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+                # ── Draw ──────────────────────────────────────────────────
+                frame = self._draw_zones(frame, line_x)
+                frame = self._draw_tracks(frame, dets)
+                frame = self._draw_dashboard(frame, frame_no, FPS)
+                writer.write(frame)
+
+                if not self.no_preview:
+                    cv2.imshow("Bus Counter v3", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
 
         cap.release()
         writer.release()
@@ -886,20 +1294,38 @@ class BusCounter:
                     cv2.line(frame, pts[j-1], pts[j], (int(255*(1-t)), int(200*t), int(120*t)), 2)
         return frame
 
-if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--source",     default="testing.mp4")
-    p.add_argument("--output",     default="result_v4.mp4")
-    p.add_argument("--model",      default="yolov8s.pt",  help="Path to YOLO model weights")
-    p.add_argument("--debug",      action="store_true",   help="Enable detailed HSV debugging (saves CSV + images)")
-    p.add_argument("--head-detect",action="store_true",   help="Use CrowdHuman-trained model for head/partial body detection")
-    p.add_argument("--visdrone",   action="store_true",   help="Auto-download and use VisDrone-pretrained YOLOv8n (best for top-down views)")
+# ═══════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════
+def main():
+    global LINE_RATIO
+
+    p = argparse.ArgumentParser(description="Bus Passenger Counter v3 + API Push")
+    p.add_argument("--source",  default="counting.mp4",   help="Input video")
+    p.add_argument("--output",  default="result_v3.mp4",  help="Output video")
+    p.add_argument("--model",   default="yolov8s.pt",     help="YOLO weights")
+    p.add_argument("--line",    type=float, default=LINE_RATIO,
+                   help="Trigger line fraction of frame width (default 0.50)")
+    p.add_argument("--exempt",  default="",
+                   help="Path to exempt_embedding.npy (skip counting this person)")
+    p.add_argument("--no-preview", action="store_true",
+                   help="Disable live preview (faster headless runs)")
+    p.add_argument("--live", action="store_true",
+                   help="Live stream mode: assume all tracks start outside")
     args = p.parse_args()
-    BusCounter(
-        args.source,
-        model_path   = args.model,
-        output_path  = args.output,
-        enable_debug = args.debug,
-        head_detect  = args.head_detect,
-        visdrone     = args.visdrone,
-    ).process()
+
+    LINE_RATIO = args.line
+
+    counter = BusCounter(
+        video_path  = args.source,
+        model_path  = args.model,
+        output_path = args.output,
+        exempt_path = args.exempt,
+        no_preview  = args.no_preview,
+        live        = args.live,
+    )
+    counter.process()
+
+
+if __name__ == "__main__":
+    main()
