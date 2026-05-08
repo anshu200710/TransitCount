@@ -694,47 +694,80 @@ class BusCounter:
             else:
                 st.side_frames  += 1
 
+            # Debug: show state transitions
+            if self.enable_debug and st.side_frames == 1:
+                print(f"  [DEBUG] ID {tid} | zone_state={st.zone_state} | "
+                      f"prev_side={st.prev_side} | moving to {current_side}")
+
             if st.side_frames >= DEBOUNCE_N:
                 if current_side == "L":
-                    if (
-                        (self.live and st.zone_state in ("ZONE", "INSIDE")
-                         and st.prev_side in ("", "R"))
-                        or (not self.live and st.zone_state in ("ZONE", "INSIDE")
-                            and st.prev_side == "R")
-                    ):
-                        if st.counted != "OUT":
-                            self.out_count += 1
-                            st.counted      = "OUT"
-                            st.flash        = FLASH_FRAMES
-                            event           = "OUT"
-                            self.events.append({
-                                "frame": f_no, "id": tid, "event": "OUT",
-                                "in": self.in_count, "out": self.out_count,
-                            })
-                            print(f"[{f_no:05d}] ID {tid:3d} LEFT    | "
-                                  f"IN={self.in_count} OUT={self.out_count}")
-                            self.api.push(self.in_count, self.out_count)
+                    # OUT event: moving to LEFT (exit)
+                    # Live mode: count if coming from ZONE or INSIDE (and prev was R or empty)
+                    # File mode: count only if coming from INSIDE (prev was R)
+                    should_count_out = False
+                    if self.live:
+                        # In live mode, allow counting if:
+                        # 1. Coming from INSIDE (clear exit)
+                        # 2. Coming from ZONE and prev_side was R or empty (started in zone, moving out)
+                        if st.zone_state == "INSIDE" and st.prev_side == "R":
+                            should_count_out = True
+                        elif st.zone_state == "ZONE" and st.prev_side in ("", "R"):
+                            should_count_out = True
+                    else:
+                        # File mode: strict - must come from INSIDE with prev_side R
+                        if st.zone_state in ("ZONE", "INSIDE") and st.prev_side == "R":
+                            should_count_out = True
+                    
+                    if should_count_out and st.counted != "OUT":
+                        self.out_count += 1
+                        st.counted      = "OUT"
+                        st.flash        = FLASH_FRAMES
+                        event           = "OUT"
+                        self.events.append({
+                            "frame": f_no, "id": tid, "event": "OUT",
+                            "in": self.in_count, "out": self.out_count,
+                        })
+                        print(f"[{f_no:05d}] ID {tid:3d} LEFT    | "
+                              f"IN={self.in_count} OUT={self.out_count}")
+                        self.api.push(self.in_count, self.out_count)
+                    elif self.enable_debug and not should_count_out:
+                        print(f"  [DEBUG] ID {tid} | OUT blocked: zone_state={st.zone_state}, "
+                              f"prev_side={st.prev_side}, counted={st.counted}")
                     st.zone_state, st.prev_side = "OUTSIDE", "L"
 
                 elif current_side == "R":
-                    if (
-                        (self.live and st.zone_state in ("ZONE", "OUTSIDE")
-                         and st.prev_side in ("", "L"))
-                        or (not self.live and st.zone_state in ("ZONE", "OUTSIDE")
-                            and st.prev_side == "L")
-                    ):
-                        if st.counted != "IN":
-                            self.in_count += 1
-                            st.counted     = "IN"
-                            st.flash       = FLASH_FRAMES
-                            event          = "IN"
-                            self.events.append({
-                                "frame": f_no, "id": tid, "event": "IN",
-                                "in": self.in_count, "out": self.out_count,
-                            })
-                            print(f"[{f_no:05d}] ID {tid:3d} ENTERED | "
-                                  f"IN={self.in_count} OUT={self.out_count}")
-                            self.api.push(self.in_count, self.out_count)
+                    # IN event: moving to RIGHT (entry)
+                    # Live mode: count if coming from ZONE or OUTSIDE (and prev was L or empty)
+                    # File mode: count only if coming from OUTSIDE (prev was L)
+                    should_count_in = False
+                    if self.live:
+                        # In live mode, allow counting if:
+                        # 1. Coming from OUTSIDE (clear entry)
+                        # 2. Coming from ZONE and prev_side was L or empty (started in zone, moving in)
+                        if st.zone_state == "OUTSIDE" and st.prev_side == "L":
+                            should_count_in = True
+                        elif st.zone_state == "ZONE" and st.prev_side in ("", "L"):
+                            should_count_in = True
+                    else:
+                        # File mode: strict - must come from OUTSIDE with prev_side L
+                        if st.zone_state in ("ZONE", "OUTSIDE") and st.prev_side == "L":
+                            should_count_in = True
+                    
+                    if should_count_in and st.counted != "IN":
+                        self.in_count += 1
+                        st.counted     = "IN"
+                        st.flash       = FLASH_FRAMES
+                        event          = "IN"
+                        self.events.append({
+                            "frame": f_no, "id": tid, "event": "IN",
+                            "in": self.in_count, "out": self.out_count,
+                        })
+                        print(f"[{f_no:05d}] ID {tid:3d} ENTERED | "
+                              f"IN={self.in_count} OUT={self.out_count}")
+                        self.api.push(self.in_count, self.out_count)
+                    elif self.enable_debug and not should_count_in:
+                        print(f"  [DEBUG] ID {tid} | IN blocked: zone_state={st.zone_state}, "
+                              f"prev_side={st.prev_side}, counted={st.counted}")
                     st.zone_state, st.prev_side = "INSIDE", "R"
 
         return event
