@@ -885,8 +885,11 @@ class BusCounter:
     # ── Main loop ─────────────────────────────────────────────────────────
 
     def process(self):
-        # Verify video file exists before attempting to open
-        if not os.path.exists(self.video_path):
+        # Check if source is a stream URL or a file
+        is_stream = self.video_path.startswith(('rtsp://', 'rtmp://', 'http://', 'https://'))
+        
+        # Verify video file exists (skip check for streams)
+        if not is_stream and not os.path.exists(self.video_path):
             raise FileNotFoundError(
                 f"Video file not found: {self.video_path}\n"
                 f"Current directory: {os.getcwd()}\n"
@@ -895,10 +898,16 @@ class BusCounter:
         
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
-            raise FileNotFoundError(
-                f"Cannot open video file: {self.video_path}\n"
-                f"The file exists but may be corrupted or in an unsupported format."
-            )
+            if is_stream:
+                raise ConnectionError(
+                    f"Cannot connect to stream: {self.video_path}\n"
+                    f"Please check the stream URL and network connection."
+                )
+            else:
+                raise FileNotFoundError(
+                    f"Cannot open video file: {self.video_path}\n"
+                    f"The file exists but may be corrupted or in an unsupported format."
+                )
 
         W   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         H   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -911,14 +920,24 @@ class BusCounter:
         print(f"Video : {W}×{H} @ {FPS:.1f} fps")
         print(f"Line  : x={line_x} ({LINE_RATIO*100:.0f}% width)")
         print(f"Zone  : x=[{line_x-DEAD_ZONE_PX}, {line_x+DEAD_ZONE_PX}]")
+        if self.live:
+            print(f"Mode  : LIVE STREAM")
         print("─" * 60)
 
         f_no = 0
+        last_csv_save = 0
+        csv_save_interval = 300  # Save CSV every 300 frames (~10 seconds at 30fps)
+        
         try:
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    break
+                    if self.live:
+                        print("[WARN] Stream interrupted, attempting to reconnect...")
+                        time.sleep(1)
+                        continue
+                    else:
+                        break
                 f_no += 1
 
                 # Detection + tracking
@@ -960,6 +979,12 @@ class BusCounter:
                 frame = self._draw_tracks(frame, dets)
                 frame = self._draw_dashboard(frame, f_no, FPS)
                 writer.write(frame)
+
+                # Periodic CSV save for live streams
+                if self.live and (f_no - last_csv_save) >= csv_save_interval:
+                    csv_path = self.output_path.replace(".mp4", "_events.csv")
+                    self._save_csv(csv_path)
+                    last_csv_save = f_no
 
                 if not self.no_preview:
                     cv2.imshow("Bus Counter — Final", frame)
