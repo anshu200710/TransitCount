@@ -977,8 +977,14 @@ class BusCounter:
             # Save debug CSV
             if self.enable_debug and self.debug_log:
                 debug_csv = os.path.join(self.debug_dir, "debug_log.csv")
+                # Collect all unique fieldnames from all entries
+                all_fieldnames = set()
+                for entry in self.debug_log:
+                    all_fieldnames.update(entry.keys())
+                fieldnames = sorted(all_fieldnames)  # Sort for consistent column order
+                
                 with open(debug_csv, "w", newline="") as f:
-                    w = csv.DictWriter(f, fieldnames=list(self.debug_log[0].keys()))
+                    w = csv.DictWriter(f, fieldnames=fieldnames)
                     w.writeheader()
                     w.writerows(self.debug_log)
                 print(f"[DEBUG] CSV saved: {debug_csv} ({len(self.debug_log)} entries)")
