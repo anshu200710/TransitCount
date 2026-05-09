@@ -50,22 +50,22 @@ except ImportError:
 
 # --- Counting geometry ---
 LINE_RATIO    = 0.45   # Trigger line as fraction of frame width
-DEAD_ZONE_PX  = 30     # Half-width of the dead zone around the line (px)
-DEBOUNCE_N    = 3      # Consecutive frames required on a side before committing
+DEAD_ZONE_PX  = 40     # Half-width of the dead zone around the line (px) (OPTIMIZED for fast crossings)
+DEBOUNCE_N    = 1      # Consecutive frames required on a side before committing (OPTIMIZED for fast crossings)
 
 # --- Detection ---
-CONF_THRESH   = 0.08   # Low conf to catch small top-down heads
+CONF_THRESH   = 0.05   # Low conf to catch small top-down heads (OPTIMIZED for fast motion)
 IOU_THRESH    = 0.45   # NMS IoU threshold
 
 # --- Tracking ---
 TRAIL_LEN     = 50     # Max trail length per track
-GHOST_TIMEOUT = 300    # Frames until an unseen track expires into ghost pool
+GHOST_TIMEOUT = 150    # Frames until an unseen track expires into ghost pool (OPTIMIZED for fast motion)
 FLASH_FRAMES  = 20     # Frames the cyan flash lasts after a count event
-EMA_ALPHA     = 0.40   # Blend weight for raw vs Kalman-predicted centroid
+EMA_ALPHA     = 0.50   # Blend weight for raw vs Kalman-predicted centroid (OPTIMIZED for fast motion)
 
 # --- Ghost re-link ---
-RELINK_DIST_PX  = 60   # Max centroid distance (px) to adopt a ghost track
-RELINK_MAX_AGE  = 45   # Ghost must have been seen within this many frames
+RELINK_DIST_PX  = 100  # Max centroid distance (px) to adopt a ghost track (OPTIMIZED for fast motion)
+RELINK_MAX_AGE  = 60   # Ghost must have been seen within this many frames (OPTIMIZED for fast motion)
 
 # --- Staff exemption (radium tape detection) ---
 RADIUM_MIN_PX   = 200  # Min yellow pixels in shoulder ROI to trigger detection
@@ -237,6 +237,19 @@ class TrackState:
     exempt_score:  int   = 0
     tape_votes:    deque = field(default_factory=lambda: deque(maxlen=VOTE_WINDOW))
     consec_miss:   int   = 0
+    
+    # --- Trajectory-based crossing detection (for ultra-fast crossings) ---
+    prev_cx:       float = 0.0   # Previous centroid x position
+    crossed_line:  bool  = False # Whether line was crossed this frame
+    prev_side:     str   = ""
+    debounce_side: str   = ""
+    last_bbox:     tuple = field(default_factory=lambda: (0, 0, 0, 0))
+
+    # --- Exemption (radium tape) ---
+    exempt:        bool  = False
+    exempt_score:  int   = 0
+    tape_votes:    deque = field(default_factory=lambda: deque(maxlen=VOTE_WINDOW))
+    consec_miss:   int   = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -249,13 +262,18 @@ class BusCounter:
                  output_path: str = "result_final.mp4",
                  enable_debug: bool = False, head_detect: bool = False,
                  visdrone: bool = False, no_preview: bool = False,
-                 live: bool = False):
+                 live: bool = False, delay_seconds: int = 0):
 
         self.video_path  = video_path
         self.output_path = output_path
         self.no_preview  = no_preview
         self.live        = live
         self.enable_debug = enable_debug
+        self.delay_seconds = delay_seconds
+        
+        # Frame buffer for delayed processing
+        self.frame_buffer = deque()
+        self.buffer_start_time = None
 
         # ── Model selection: visdrone > head_detect > default ────────────
         if visdrone:
@@ -661,6 +679,27 @@ class BusCounter:
         if st.flash > 0:
             st.flash -= 1
 
+        # ── Line crossing detection (for ultra-fast crossings) ───────────
+        # Detect if person crossed the line between frames
+        st.crossed_line = False
+        if st.prev_cx > 0:  # Not first frame
+            # Check if line was crossed between prev_cx and current cx
+            # Line crossing occurs when prev and current are on opposite sides
+            if (st.prev_cx < line_x and st.cx > line_x):
+                # Crossed from LEFT to RIGHT (IN event)
+                st.crossed_line = True
+                crossing_direction = "IN"
+            elif (st.prev_cx > line_x and st.cx < line_x):
+                # Crossed from RIGHT to LEFT (OUT event)
+                st.crossed_line = True
+                crossing_direction = "OUT"
+            else:
+                crossing_direction = None
+        else:
+            crossing_direction = None
+        
+        st.prev_cx = st.cx  # Store for next frame
+
         # Exempt / SKIP IDs never count
         if st.exempt:
             return None
@@ -677,6 +716,42 @@ class BusCounter:
         # Cooldown after a count — freeze transitions
         if st.flash > 0:
             return None
+
+        # ── Ultra-fast line crossing detection ───────────────────────────
+        # If person crossed the line in a single frame, count immediately
+        # This catches crossings that skip the ZONE entirely
+        if st.crossed_line and crossing_direction:
+            if crossing_direction == "IN" and st.counted != "IN":
+                # Person crossed from LEFT to RIGHT
+                self.in_count += 1
+                st.counted     = "IN"
+                st.flash       = FLASH_FRAMES
+                st.zone_state  = "INSIDE"
+                st.prev_side   = "R"
+                self.events.append({
+                    "frame": f_no, "id": tid, "event": "IN",
+                    "in": self.in_count, "out": self.out_count,
+                })
+                print(f"[{f_no:05d}] ID {tid:3d} ENTERED (FAST) | "
+                      f"IN={self.in_count} OUT={self.out_count}")
+                self.api.push(self.in_count, self.out_count)
+                return "IN"
+            
+            elif crossing_direction == "OUT" and st.counted != "OUT":
+                # Person crossed from RIGHT to LEFT
+                self.out_count += 1
+                st.counted      = "OUT"
+                st.flash        = FLASH_FRAMES
+                st.zone_state   = "OUTSIDE"
+                st.prev_side    = "L"
+                self.events.append({
+                    "frame": f_no, "id": tid, "event": "OUT",
+                    "in": self.in_count, "out": self.out_count,
+                })
+                print(f"[{f_no:05d}] ID {tid:3d} LEFT (FAST)    | "
+                      f"IN={self.in_count} OUT={self.out_count}")
+                self.api.push(self.in_count, self.out_count)
+                return "OUT"
 
         # ── State-machine transition ──────────────────────────────────────
         event        = None
@@ -915,6 +990,56 @@ class BusCounter:
                 })
         print(f"CSV saved: {path}")
 
+    # ── Frame processing helper ───────────────────────────────────────────
+
+    def _process_frame(self, frame_data: dict, line_x: int, fps: float, 
+                       writer: cv2.VideoWriter) -> np.ndarray:
+        """Process a single frame (used for both normal and delayed processing)."""
+        frame = frame_data['frame']
+        f_no = frame_data['frame_no']
+        
+        # Detection + tracking
+        track_args = dict(
+            conf    = CONF_THRESH,
+            iou     = IOU_THRESH,
+            verbose = False,
+            tracker = TRACKER_CONFIG,
+            persist = True,
+        )
+        track_args["classes"] = [0]   # person class (adjust for VisDrone: [1])
+
+        results = self.model.track(frame, **track_args)[0]
+
+        # Build supervision Detections for drawing
+        tids = results.boxes.id
+        dets = sv.Detections(
+            xyxy       = results.boxes.xyxy.cpu().numpy(),
+            confidence = results.boxes.conf.cpu().numpy()
+                         if results.boxes.conf is not None else None,
+            class_id   = results.boxes.cls.cpu().numpy().astype(int)
+                         if results.boxes.cls is not None else None,
+            tracker_id = tids.cpu().numpy().astype(int)
+                         if tids is not None else None,
+        )
+
+        # Update state machine for each detected track
+        if tids is not None:
+            for bbox, tid in zip(results.boxes.xyxy.cpu().numpy(),
+                                 tids.cpu().numpy().astype(int)):
+                self._update_track(int(tid), bbox, line_x, f_no, frame, fps)
+
+        # Periodic ghost maintenance
+        if f_no % 90 == 0:
+            self._purge_ghosts(f_no)
+
+        # Draw
+        frame = self._draw_zones(frame, line_x)
+        frame = self._draw_tracks(frame, dets)
+        frame = self._draw_dashboard(frame, f_no, fps)
+        writer.write(frame)
+        
+        return frame
+
     # ── Main loop ─────────────────────────────────────────────────────────
 
     def process(self):
@@ -955,11 +1080,19 @@ class BusCounter:
         print(f"Zone  : x=[{line_x-DEAD_ZONE_PX}, {line_x+DEAD_ZONE_PX}]")
         if self.live:
             print(f"Mode  : LIVE STREAM")
+        elif self.delay_seconds > 0:
+            print(f"Mode  : DELAYED PROCESSING ({self.delay_seconds}s delay)")
         print("─" * 60)
 
         f_no = 0
         last_csv_save = 0
         csv_save_interval = 300  # Save CSV every 300 frames (~10 seconds at 30fps)
+        
+        # For delayed processing
+        use_delay = (not self.live) and (self.delay_seconds > 0)
+        if use_delay:
+            self.buffer_start_time = time.time()
+            print(f"[DELAY] Buffering {self.delay_seconds}s before processing starts...")
         
         try:
             while True:
@@ -970,59 +1103,71 @@ class BusCounter:
                         time.sleep(1)
                         continue
                     else:
+                        # Process remaining buffered frames
+                        if use_delay:
+                            while self.frame_buffer:
+                                buffered_data = self.frame_buffer.popleft()
+                                self._process_frame(buffered_data, line_x, FPS, writer)
                         break
+                
+                current_time = time.time()
                 f_no += 1
+                
+                if use_delay:
+                    # Add frame to buffer with timestamp
+                    self.frame_buffer.append({
+                        'frame': frame.copy(),
+                        'frame_no': f_no,
+                        'timestamp': current_time
+                    })
+                    
+                    # Process frames that are older than delay threshold
+                    while self.frame_buffer:
+                        oldest = self.frame_buffer[0]
+                        age = current_time - oldest['timestamp']
+                        
+                        if age >= self.delay_seconds:
+                            buffered_data = self.frame_buffer.popleft()
+                            processed_frame = self._process_frame(buffered_data, line_x, FPS, writer)
+                            
+                            # Periodic CSV save
+                            if (buffered_data['frame_no'] - last_csv_save) >= csv_save_interval:
+                                csv_path = self.output_path.replace(".mp4", "_events.csv")
+                                self._save_csv(csv_path)
+                                last_csv_save = buffered_data['frame_no']
+                            
+                            if not self.no_preview:
+                                # Show delay info on preview
+                                delay_text = f"DELAYED: {self.delay_seconds}s | Buffer: {len(self.frame_buffer)} frames"
+                                cv2.putText(processed_frame, delay_text, (10, H - 20),
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2, cv2.LINE_AA)
+                                cv2.imshow("Bus Counter — Final (Delayed)", processed_frame)
+                                if cv2.waitKey(1) & 0xFF == ord("q"):
+                                    return
+                        else:
+                            break
+                    
+                    # Simulate real-time by sleeping to match video FPS
+                    time.sleep(1.0 / FPS)
+                    
+                else:
+                    # Normal processing (live or no delay)
+                    processed_frame = self._process_frame({
+                        'frame': frame,
+                        'frame_no': f_no,
+                        'timestamp': current_time
+                    }, line_x, FPS, writer)
+                    
+                    # Periodic CSV save for live streams
+                    if self.live and (f_no - last_csv_save) >= csv_save_interval:
+                        csv_path = self.output_path.replace(".mp4", "_events.csv")
+                        self._save_csv(csv_path)
+                        last_csv_save = f_no
 
-                # Detection + tracking
-                track_args = dict(
-                    conf    = CONF_THRESH,
-                    iou     = IOU_THRESH,
-                    verbose = False,
-                    tracker = TRACKER_CONFIG,
-                    persist = True,
-                )
-                track_args["classes"] = [0]   # person class (adjust for VisDrone: [1])
-
-                results = self.model.track(frame, **track_args)[0]
-
-                # Build supervision Detections for drawing
-                tids = results.boxes.id
-                dets = sv.Detections(
-                    xyxy       = results.boxes.xyxy.cpu().numpy(),
-                    confidence = results.boxes.conf.cpu().numpy()
-                                 if results.boxes.conf is not None else None,
-                    class_id   = results.boxes.cls.cpu().numpy().astype(int)
-                                 if results.boxes.cls is not None else None,
-                    tracker_id = tids.cpu().numpy().astype(int)
-                                 if tids is not None else None,
-                )
-
-                # Update state machine for each detected track
-                if tids is not None:
-                    for bbox, tid in zip(results.boxes.xyxy.cpu().numpy(),
-                                         tids.cpu().numpy().astype(int)):
-                        self._update_track(int(tid), bbox, line_x, f_no, frame, FPS)
-
-                # Periodic ghost maintenance
-                if f_no % 90 == 0:
-                    self._purge_ghosts(f_no)
-
-                # Draw
-                frame = self._draw_zones(frame, line_x)
-                frame = self._draw_tracks(frame, dets)
-                frame = self._draw_dashboard(frame, f_no, FPS)
-                writer.write(frame)
-
-                # Periodic CSV save for live streams
-                if self.live and (f_no - last_csv_save) >= csv_save_interval:
-                    csv_path = self.output_path.replace(".mp4", "_events.csv")
-                    self._save_csv(csv_path)
-                    last_csv_save = f_no
-
-                if not self.no_preview:
-                    cv2.imshow("Bus Counter — Final", frame)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
+                    if not self.no_preview:
+                        cv2.imshow("Bus Counter — Final", processed_frame)
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            break
 
         finally:
             cap.release()
@@ -1078,6 +1223,8 @@ def main():
                    help="Disable live preview window (faster headless runs)")
     p.add_argument("--live",        action="store_true",
                    help="Live-stream mode: treat all new IDs as starting outside")
+    p.add_argument("--delay",       type=int, default=0,
+                   help="Delay in seconds for recorded video processing (simulates real-time, default 0=no delay)")
     p.add_argument("--debug",       action="store_true",
                    help="Save per-frame HSV analysis images + CSV")
     p.add_argument("--head-detect", action="store_true",
@@ -1097,6 +1244,7 @@ def main():
         visdrone    = args.visdrone,
         no_preview  = args.no_preview,
         live        = args.live,
+        delay_seconds = args.delay,
     )
     counter.process()
 
