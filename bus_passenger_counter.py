@@ -50,11 +50,11 @@ except ImportError:
 
 # --- Counting geometry ---
 LINE_RATIO    = 0.45   # Trigger line as fraction of frame width
-DEAD_ZONE_PX  = 40     # Half-width of the dead zone around the line (px) (OPTIMIZED for fast crossings)
+DEAD_ZONE_PX  = 25     # Half-width of the dead zone around the line (px) (OPTIMIZED for live fast crossings)
 DEBOUNCE_N    = 1      # Consecutive frames required on a side before committing (OPTIMIZED for fast crossings)
 
 # --- Detection ---
-CONF_THRESH   = 0.05   # Low conf to catch small top-down heads (OPTIMIZED for fast motion)
+CONF_THRESH   = 0.03   # Very low conf to catch fast-moving persons in live streams (OPTIMIZED)
 IOU_THRESH    = 0.45   # NMS IoU threshold
 
 # --- Tracking ---
@@ -81,7 +81,7 @@ MERGE_AR_THRESH = 1.5  # Width/height ratio above which bbox likely contains 2 p
 MERGE_OVERLAP   = 0.30 # IoU above which two tracks are considered overlapping
 
 # --- API ---
-API_ENDPOINT    = "https://bae6-49-205-179-53.ngrok-free.app/passenger-count"
+API_ENDPOINT    = "https://f858-49-205-176-68.ngrok-free.app/api/passenger-count"
 API_TIMEOUT     = 2    # seconds per request
 API_MAX_RETRY   = 2    # retries on 5xx
 API_RETRY_WAIT  = 0.3  # seconds between retries
@@ -136,7 +136,7 @@ class ApiPushWorker:
             "hin":      in_count,
             "hout":     out_count,
             "inside":   inside,
-            "total":    in_count,
+            "total":    inside,  # FIXED: Send people currently inside (not total entered)
         }
         self._q.put(payload)
 
@@ -682,6 +682,8 @@ class BusCounter:
         # ── Line crossing detection (for ultra-fast crossings) ───────────
         # Detect if person crossed the line between frames
         st.crossed_line = False
+        crossing_direction = None
+        
         if st.prev_cx > 0:  # Not first frame
             # Check if line was crossed between prev_cx and current cx
             # Line crossing occurs when prev and current are on opposite sides
@@ -693,10 +695,18 @@ class BusCounter:
                 # Crossed from RIGHT to LEFT (OUT event)
                 st.crossed_line = True
                 crossing_direction = "OUT"
-            else:
-                crossing_direction = None
         else:
-            crossing_direction = None
+            # First frame: check if already past the line (ultra-fast entry)
+            # This catches persons who appear and are already on the other side
+            if st.cx > line_x + DEAD_ZONE_PX:
+                # First detection is already on RIGHT side (INSIDE)
+                # Assume they crossed from LEFT (entered)
+                st.crossed_line = True
+                crossing_direction = "IN"
+            elif st.cx < line_x - DEAD_ZONE_PX:
+                # First detection is on LEFT side (OUTSIDE)
+                # This is normal, no crossing yet
+                pass
         
         st.prev_cx = st.cx  # Store for next frame
 
