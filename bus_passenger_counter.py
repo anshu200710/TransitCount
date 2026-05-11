@@ -241,15 +241,6 @@ class TrackState:
     # --- Trajectory-based crossing detection (for ultra-fast crossings) ---
     prev_cx:       float = 0.0   # Previous centroid x position
     crossed_line:  bool  = False # Whether line was crossed this frame
-    prev_side:     str   = ""
-    debounce_side: str   = ""
-    last_bbox:     tuple = field(default_factory=lambda: (0, 0, 0, 0))
-
-    # --- Exemption (radium tape) ---
-    exempt:        bool  = False
-    exempt_score:  int   = 0
-    tape_votes:    deque = field(default_factory=lambda: deque(maxlen=VOTE_WINDOW))
-    consec_miss:   int   = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -697,8 +688,26 @@ class BusCounter:
             return None
 
         # ── Ultra-fast line crossing detection ───────────────────────────
+        # Detect if person crossed the line in a single frame (skipping ZONE)
+        # This catches very fast crossings that bypass the normal state machine
+        crossing_direction = None
+        st.crossed_line = False
+        
+        if st.prev_cx != 0.0:  # Not first frame for this track
+            # Check if line was crossed between prev_cx and current cx
+            if st.prev_cx < line_x <= st.cx:
+                # Crossed from LEFT to RIGHT (ENTRY)
+                st.crossed_line = True
+                crossing_direction = "IN"
+            elif st.prev_cx > line_x >= st.cx:
+                # Crossed from RIGHT to LEFT (EXIT)
+                st.crossed_line = True
+                crossing_direction = "OUT"
+        
+        # Update prev_cx for next frame
+        st.prev_cx = st.cx
+        
         # If person crossed the line in a single frame, count immediately
-        # This catches crossings that skip the ZONE entirely
         if st.crossed_line and crossing_direction:
             if crossing_direction == "IN" and st.counted != "IN":
                 # Person crossed from LEFT to RIGHT
