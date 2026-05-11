@@ -637,6 +637,7 @@ API_ENDPOINT = "https://your-api-endpoint.com/passenger-count"
 ```json
 {
     "datetime": "2024-05-08 14:30:45",
+<<<<<<< HEAD
     "hin": 15,
     "hout": 8,
     "inside": 7,
@@ -644,6 +645,23 @@ API_ENDPOINT = "https://your-api-endpoint.com/passenger-count"
 }
 ```
 
+=======
+    "hin": 15,      // Total people entered (cumulative)
+    "hout": 8,      // Total people exited (cumulative)
+    "inside": 7,    // People currently inside the bus
+    "total": 7      // People currently inside (same as "inside")
+}
+```
+
+**Note:** The `total` field sends the number of people **currently inside the bus**, not the total entered.
+
+### Calculation
+```python
+inside = max(0, hin - hout)
+total = inside  // Same value
+```
+
+>>>>>>> 28e708955590cac18e7b687acfb6342199eb457c
 ### Testing API
 ```bash
 # Run with delay to test API timing
@@ -652,6 +670,11 @@ python bus_passenger_counter.py \
     --delay 60
 ```
 
+<<<<<<< HEAD
+=======
+**See:** `API_PAYLOAD_FIX.md` for detailed API documentation
+
+>>>>>>> 28e708955590cac18e7b687acfb6342199eb457c
 ---
 
 ## 📊 System Requirements

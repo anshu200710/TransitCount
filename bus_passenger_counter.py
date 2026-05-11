@@ -50,11 +50,11 @@ except ImportError:
 
 # --- Counting geometry ---
 LINE_RATIO    = 0.45   # Trigger line as fraction of frame width
-DEAD_ZONE_PX  = 40     # Half-width of the dead zone around the line (px) (OPTIMIZED for fast crossings)
-DEBOUNCE_N    = 1      # Consecutive frames required on a side before committing (OPTIMIZED for fast crossings)
+DEAD_ZONE_PX  = 30     # Half-width of the dead zone around the line (px)
+DEBOUNCE_N    = 3      # Consecutive frames required on a side before committing
 
 # --- Detection ---
-CONF_THRESH   = 0.05   # Low conf to catch small top-down heads (OPTIMIZED for fast motion)
+CONF_THRESH   = 0.08   # Low conf to catch small top-down heads
 IOU_THRESH    = 0.45   # NMS IoU threshold
 
 # --- Tracking ---
@@ -81,7 +81,7 @@ MERGE_AR_THRESH = 1.5  # Width/height ratio above which bbox likely contains 2 p
 MERGE_OVERLAP   = 0.30 # IoU above which two tracks are considered overlapping
 
 # --- API ---
-API_ENDPOINT    = "https://2f0d-2401-4900-1f36-5ce9-70da-6769-f49c-860.ngrok-free.app/passenger-count"
+API_ENDPOINT    = "https://bae6-49-205-179-53.ngrok-free.app/passenger-count"
 API_TIMEOUT     = 2    # seconds per request
 API_MAX_RETRY   = 2    # retries on 5xx
 API_RETRY_WAIT  = 0.3  # seconds between retries
@@ -136,7 +136,7 @@ class ApiPushWorker:
             "hin":      in_count,
             "hout":     out_count,
             "inside":   inside,
-            "total":    in_count,
+            "total":    inside,  # FIXED: Send people currently inside (not total entered)
         }
         self._q.put(payload)
 
@@ -678,27 +678,6 @@ class BusCounter:
 
         if st.flash > 0:
             st.flash -= 1
-
-        # ── Line crossing detection (for ultra-fast crossings) ───────────
-        # Detect if person crossed the line between frames
-        st.crossed_line = False
-        if st.prev_cx > 0:  # Not first frame
-            # Check if line was crossed between prev_cx and current cx
-            # Line crossing occurs when prev and current are on opposite sides
-            if (st.prev_cx < line_x and st.cx > line_x):
-                # Crossed from LEFT to RIGHT (IN event)
-                st.crossed_line = True
-                crossing_direction = "IN"
-            elif (st.prev_cx > line_x and st.cx < line_x):
-                # Crossed from RIGHT to LEFT (OUT event)
-                st.crossed_line = True
-                crossing_direction = "OUT"
-            else:
-                crossing_direction = None
-        else:
-            crossing_direction = None
-        
-        st.prev_cx = st.cx  # Store for next frame
 
         # Exempt / SKIP IDs never count
         if st.exempt:
