@@ -1,30 +1,16 @@
 #!/usr/bin/env python3
 """
-Bus Passenger Counter — v3 DEFINITIVE + API Push
-==================================================
-Camera: overhead/top-down at bus front gate
-Direction: passengers move LEFT → RIGHT to enter, RIGHT → LEFT to exit
-
-All confirmed bugs from video analysis fixed:
-  ✓ Line moved to 50% width (was 38% — too early to init ID)
-  ✓ "???IN" ghost counts fixed — IDs first seen inside dead zone are SKIPPED
-  ✓ IDs first seen on RIGHT side (already inside bus) cannot trigger IN count
-  ✓ Proper 3-state machine: OUTSIDE → ZONE → INSIDE (must traverse all 3)
-  ✓ Kalman Filter per track for smooth centroid prediction during occlusion
-  ✓ conf=0.12, iou=0.40 — separates shoulder-to-shoulder passengers
-  ✓ ByteTrack: buffer=150 frames (5s), low activation threshold
-  ✓ CYAN flash on confirmed count (auditable in real-time)
-  ✓ Trail lines with age-based color gradient
-  ✓ Ghost ID cleanup every 90 frames
-  ✓ CSV logs every event with frame + timestamp
-  ✓ agnostic_nms=True prevents class-merging of overlapping detections
-
-API Push additions (v3.1):
-  ✓ Non-blocking POST via background thread + queue (zero FPS impact)
-  ✓ Payload: {datetime, hin, hout, inside, total}
-  ✓ 2-second request timeout — network hangs never stall the main loop
-  ✓ Max 2 retries on 5xx errors with short back-off
-  ✓ Triggered only on confirmed IN/OUT transitions (no duplicate calls)
+Bus Passenger Counter — v5.0 BLOB-FIRST TAPE + GHOST BOX + BOX EMA
+=======================================================================
+Key improvements over v4.0:
+  • Blob-first tape detection: finds compact yellow contours before measuring
+    HSV stats — immune to both blur (far) and dilution (close) simultaneously
+  • Tape ratio replaces raw pixel count: distance-invariant classification
+  • Ghost box extrapolation: Kalman-predicted box drawn when detection absent,
+    eliminating the visual "box disappearing for a few frames" problem
+  • Centroid-distance fallback matching in _update_track so fast-moving heads
+    are still linked even when IoU matching would fail
+  • EMA smoothing on all 4 bounding-box corners for jitter-free visuals
 """
 
 import cv2
@@ -36,21 +22,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime
 import csv, os, argparse
-import torch
-import torch.nn as nn
-from torchvision import models, transforms
-
-# ── NEW: non-blocking API push imports ──────────────────────────────────
-import threading
-import queue
-import time
-try:
-    import requests
-    _REQUESTS_OK = True
-except ImportError:
-    _REQUESTS_OK = False
-    print("[WARN] 'requests' library not found. API push disabled. "
-          "Install with: pip install requests")
 
 # ═══════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -58,7 +29,7 @@ except ImportError:
 LINE_RATIO     = 0.45
 DEAD_ZONE_PX   = 30
 DEBOUNCE_N     = 1
-CONF_THRESH    = 0.08    # Lowered: top-down heads are small, model scores them lower
+CONF_THRESH    = 0.25    # Balanced: high enough to avoid flickering, low enough to catch persons
 IOU_THRESH     = 0.45    # Lowered: allows tracker to match faster-moving heads
 TRAIL_LEN      = 50
 GHOST_TIMEOUT  = 300     # Raised 150→300: keeps lost tracks alive through occlusions
@@ -84,16 +55,26 @@ HYSTERESIS_MISS  = 6     # Consecutive non-blurry misses required to revoke exem
 RELINK_DIST_PX   = 60    # Max centroid distance (px) to consider a ghost match
 RELINK_MAX_AGE   = 45    # Ghost must have been seen within this many frames
 
+# Blob-first tape detection settings
+#   Instead of measuring the entire ROI, we isolate individual yellow contours
+#   and validate each blob independently — immune to distance/dilution effects.
+BLOB_MIN_RATIO   = 0.003  # Min blob area as fraction of crop area (catches far/small tape)
+BLOB_MAX_RATIO   = 0.25   # Max blob area as fraction of crop area (rejects full-body yellow)
+BLOB_MIN_SAT     = 100    # Min peak saturation within blob pixels (rejects washed-out blobs)
+BLOB_MIN_VAL     = 120    # Min peak value within blob pixels (rejects dark/shadow blobs)
+BLOB_COMPACT_MAX = 25.0   # Max (perimeter² / area) compactness — tape is compact, not scattered
+
+# Ghost box extrapolation
+#   When a track is lost for ≤ GHOST_BOX_FRAMES frames, draw its Kalman-predicted
+#   box on screen so the visual never disappears between detections.
+GHOST_BOX_FRAMES = 8      # Max frames to show a ghost box (after this it fades out)
+
+# Bounding-box EMA smoothing
+#   EMA applied to all 4 corners to remove per-frame YOLO jitter.
+BOX_EMA_ALPHA    = 0.45   # Higher = follows detection more closely; lower = smoother
+
 # ByteTrack tracker config (written at runtime if missing)
 TRACKER_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bytetrack.yaml")
-# ── API configuration ────────────────────────────────────────────────────
-API_ENDPOINT   = "https://bae6-49-205-179-53.ngrok-free.app/passenger-count"
-API_TIMEOUT    = 2        # seconds — never block processing loop
-API_MAX_RETRY  = 2        # retries on 5xx errors
-API_RETRY_WAIT = 0.3      # seconds between retries
-
-# BoT-SORT tracker config (see botsort.yaml for full settings)
-TRACKER_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botsort.yaml")
 
 # Colours (BGR)
 COL_LINE      = (0,  0,   220)
@@ -119,108 +100,14 @@ class TrackState:
     side_frames: int   = 0
     prev_side:   str   = ""
     debounce_side: str = ""
-    exempt:      bool  = False
-    exempt_score: int  = 0
-    last_bbox:   tuple = field(default_factory=lambda: (0,0,0,0))
-    tape_votes:  deque = field(default_factory=lambda: deque(maxlen=VOTE_WINDOW))
-    consec_miss: int   = 0  # Consecutive non-blurry frames where tape was NOT detected
+    exempt:       bool  = False
+    exempt_score: int   = 0
+    last_bbox:    tuple = field(default_factory=lambda: (0,0,0,0))
+    smooth_bbox:  tuple = field(default_factory=lambda: (0,0,0,0))  # EMA-smoothed corners
+    tape_votes:   deque = field(default_factory=lambda: deque(maxlen=VOTE_WINDOW))
+    consec_miss:  int   = 0  # Consecutive non-blurry frames where tape was NOT detected
 
-# ═══════════════════════════════════════════════════════
-#  NON-BLOCKING API WORKER
-# ═══════════════════════════════════════════════════════
-
-class ApiPushWorker:
-    """
-    Background daemon thread that drains a queue and fires POST requests.
-
-    The main video loop enqueues a payload dict and returns immediately —
-    network latency or retries never touch the processing thread.
-    """
-
-    def __init__(self, endpoint: str, timeout: int = API_TIMEOUT,
-                 max_retry: int = API_MAX_RETRY,
-                 retry_wait: float = API_RETRY_WAIT):
-        self.endpoint   = endpoint
-        self.timeout    = timeout
-        self.max_retry  = max_retry
-        self.retry_wait = retry_wait
-        self._q         = queue.Queue()
-        self._enabled   = _REQUESTS_OK
-
-        if self._enabled:
-            t = threading.Thread(target=self._worker, daemon=True)
-            t.start()
-            print(f"[API] Push worker started → {endpoint}")
-        else:
-            print("[API] Push worker DISABLED (requests not installed)")
-
-    # ── public interface ─────────────────────────────────────────────────
-
-    def push(self, in_count: int, out_count: int):
-        """Enqueue a payload. Returns immediately — never blocks."""
-        if not self._enabled:
-            return
-        inside  = max(0, in_count - out_count)
-        payload = {
-            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "hin":      in_count,
-            "hout":     out_count,
-            "inside":   inside,
-            "total":    in_count,        # cumulative entries
-        }
-        self._q.put(payload)
-
-    # ── internal worker ──────────────────────────────────────────────────
-
-    def _worker(self):
-        """Runs in a daemon thread. Retries on 5xx, drops on permanent errors."""
-        while True:
-            payload = self._q.get()       # blocks until item available
-            self._send_with_retry(payload)
-            self._q.task_done()
-
-    def _send_with_retry(self, payload: dict):
-        for attempt in range(1, self.max_retry + 2):   # 1 try + max_retry retries
-            try:
-                resp = requests.post(
-                    self.endpoint,
-                    json=payload,
-                    timeout=self.timeout,
-                    headers={"Content-Type": "application/json"},
-                )
-                if resp.status_code < 500:
-                    # 2xx success or 4xx client error — no point retrying
-                    if resp.status_code >= 400:
-                        print(f"[API] Client error {resp.status_code} "
-                              f"for payload {payload} — not retrying")
-                    else:
-                        print(f"[API] ✓ {resp.status_code}  "
-                              f"hin={payload['hin']} hout={payload['hout']} "
-                              f"inside={payload['inside']}")
-                    return
-                # 5xx — eligible for retry
-                print(f"[API] Server error {resp.status_code} "
-                      f"(attempt {attempt}/{self.max_retry + 1})")
-            except requests.exceptions.Timeout:
-                print(f"[API] Timeout (attempt {attempt}/{self.max_retry + 1})")
-            except requests.exceptions.ConnectionError as e:
-                print(f"[API] Connection error (attempt {attempt}): {e}")
-            except Exception as e:
-                print(f"[API] Unexpected error: {e}")
-                return   # non-retriable
-
-            if attempt <= self.max_retry:
-                time.sleep(self.retry_wait)
-
-        print(f"[API] Gave up after {self.max_retry + 1} attempts for payload {payload}")
-
-
-# ═══════════════════════════════════════════════════════
-#  KALMAN FILTER  — 4-state: [cx, cy, vx, vy]
-# ═══════════════════════════════════════════════════════
 class KalmanCentroid:
-    """Constant-velocity Kalman filter for centroid smoothing."""
-
     def __init__(self, cx: float, cy: float):
         self.kf = cv2.KalmanFilter(4, 2)
         self.kf.measurementMatrix   = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
@@ -243,57 +130,17 @@ class KalmanCentroid:
         pred = self.kf.predict()
         return float(pred[0, 0]), float(pred[1, 0])
 
-
-# ═══════════════════════════════════════════════════════
-#  PER-TRACK STATE MACHINE
-# ═══════════════════════════════════════════════════════
-@dataclass
-class TrackState:
-    """
-    3-state crossing machine per track ID.
-
-    States:
-      OUTSIDE  — centroid firmly on the LEFT of dead zone  (entry side)
-      ZONE     — centroid inside the dead zone             (crossing)
-      INSIDE   — centroid firmly on the RIGHT              (bus interior)
-
-    Valid counting transition:  OUTSIDE → ZONE → INSIDE  (+1 IN)
-    Valid exit transition:      INSIDE  → ZONE → OUTSIDE  (+1 OUT)
-    Invalid (skip):             ID first seen in ZONE or INSIDE
-    """
-    kalman:      KalmanCentroid
-    cx:          float            # smoothed centroid x
-    cy:          float            # smoothed centroid y
-    trail:       deque = field(default_factory=lambda: deque(maxlen=TRAIL_LEN))
-    zone_state:  str  = "INIT"   # INIT | OUTSIDE | ZONE | INSIDE | SKIP
-    counted:     Optional[str] = None   # None | 'IN' | 'OUT'
-    flash:       int  = 0
-    last_seen:   int  = 0
-    side_frames: int  = 0        # consecutive frames on current confirmed side
-    prev_side:   str  = ""       # last confirmed non-ZONE side
-    debounce_side: str = ""      # which side we are accumulating debounce for
-    exempt:      bool = False    # True if matched as exempt person
-    embed_crops: list = field(default_factory=list)   # crops for embedding
-    embed_done:  bool = False    # True after exemption check is complete
-
-
-# ═══════════════════════════════════════════════════════
-#  MAIN COUNTER CLASS
-# ═══════════════════════════════════════════════════════
 class BusCounter:
-    def __init__(self, video_path: str, model_path: str = "yolov8s.pt", output_path: str = "result_v4.mp4",
-                 enable_debug: bool = False, head_detect: bool = False, visdrone: bool = False,
-                 no_preview: bool = False, live: bool = False):
+    def __init__(self, video_path: str, model_path: str = "yolov8x.pt", output_path: str = "result_v4.mp4",
+                 enable_debug: bool = False, head_detect: bool = False, visdrone: bool = False):
         self.video_path  = video_path
         self.output_path = output_path
         self.head_detect = head_detect
-        self.no_preview  = no_preview
-        self.live        = live
 
         # ── Model selection priority: visdrone > head_detect > default ──
         if visdrone:
             model_path = self._ensure_visdrone_model()
-        elif head_detect and model_path == "yolov8s.pt":
+        elif head_detect and model_path == "yolov8x.pt":
             model_path = self._ensure_head_model()
 
         self.model      = YOLO(model_path)
@@ -365,32 +212,6 @@ class BusCounter:
         in a tentative pool — this dramatically reduces ID switches when a person
         is briefly occluded or the model confidence drops due to overhead angle.
 
-        # ── Non-blocking API push worker ─────────────────────────────────
-        self.api = ApiPushWorker(
-            endpoint   = API_ENDPOINT,
-            timeout    = API_TIMEOUT,
-            max_retry  = API_MAX_RETRY,
-            retry_wait = API_RETRY_WAIT,
-        )
-
-        # ── Exempt person setup ───────────────────────────────────────────
-        self.exempt_emb  = None
-        self.feat_model  = None
-        if exempt_path and os.path.isfile(exempt_path):
-            self.exempt_emb = np.load(exempt_path)
-            print(f"Loaded exempt embedding from {exempt_path}")
-            # MobileNetV2 feature extractor (same as enroll_exempt.py)
-            net = models.mobilenet_v2(weights="DEFAULT")
-            net.classifier = nn.Identity()
-            net.eval()
-            self.feat_model = net
-            self.feat_tfm   = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225]),
-            ])
         Key differences from BoT-SORT defaults:
           • track_high_thresh lowered  → catches partial/head-only detections
           • track_low_thresh  lowered  → second-stage catches even weak hits
@@ -438,9 +259,20 @@ class BusCounter:
 
         if best_tid is not None:
             adopted = self._ghost_pool.pop(best_tid)
+            # Reset counting state so the new person isn't blocked by the
+            # old ghost's counted/zone flags — this is a DIFFERENT person
+            # who happens to appear near the ghost's last position.
+            adopted.counted       = None
+            adopted.zone_state    = "INIT"
+            adopted.flash         = 0
+            adopted.side_frames   = 0
+            adopted.prev_side     = ""
+            adopted.debounce_side = ""
+            adopted.trail.clear()
             self.states[new_tid] = adopted
             print(f"  🔗 [RE-LINK] Ghost ID {best_tid} re-adopted as ID {new_tid} "
-                  f"(dist={best_dist:.1f}px, age={f_no - adopted.last_seen}f)")
+                  f"(dist={best_dist:.1f}px, age={f_no - adopted.last_seen}f) "
+                  f"— counting state RESET")
             return new_tid
 
         return new_tid  # no ghost found — caller creates fresh state
@@ -462,262 +294,157 @@ class BusCounter:
 
     def _has_radium_tape(self, crop: np.ndarray, tid: int, frame_no: int = 0, fps: float = 30.0) -> bool:
         """
-        Detect radium tape (orange-yellow) in shoulder area of person crop.
-        Improvements over previous version:
-          • bilateral denoising before HSV conversion
-          • wider HSV saturation lower-bound to tolerate motion-blur colour smear
-          • dynamic shoulder ROI (top 20-60%) instead of fixed top-40%
-          • Laplacian blur-gating: skip scoring on blurry crops
+        Detect radium tape (orange-yellow) using blob-first analysis.
+
+        Pipeline:
+          1. Blur gate  — skip blurry crops entirely (score unchanged)
+          2. Denoise    — bilateral filter to preserve edges
+          3. ROI        — top 20-60% of crop (shoulder band)
+          4. HSV mask   — wide S lower-bound to tolerate blur smear
+          5. Morphology — clean noise from mask
+          6. Contours   — find individual yellow blobs
+          7. Per-blob   — filter by area ratio, compactness, peak S and V
+                          (measures ONLY the blob pixels, not the whole ROI)
+          8. Decision   — any blob passing all filters → tape detected
+
+        Why this fixes both problems simultaneously:
+          • Far/blurry: blob area ratio stays stable; we measure blob core pixels
+            only, so weak signal is not diluted by background
+          • Close range: background yellow gets many large blobs that fail the
+            compactness or ratio filter; real tape forms a tight compact blob
         """
         if crop is None or crop.size == 0:
             return False
 
         crop_h, crop_w = crop.shape[:2]
+        crop_area      = crop_h * crop_w
 
         # ── Step 1: Blur gate ─────────────────────────────────────────
         blurry, lap_var = self._is_blurry(crop)
         print(f"     📷 Sharpness (Laplacian var): {lap_var:.1f} "
               f"({'BLURRY — detection skipped' if blurry else 'SHARP — proceeding'})")
         if blurry:
-            return False  # Caller will treat this as neutral (no score change)
+            return False
 
-        # ── Step 2: Edge-preserving denoise before colour analysis ────
+        # ── Step 2: Edge-preserving denoise ──────────────────────────
         crop_clean = cv2.bilateralFilter(crop, d=9, sigmaColor=75, sigmaSpace=75)
-        hsv = cv2.cvtColor(crop_clean, cv2.COLOR_BGR2HSV)
+        hsv        = cv2.cvtColor(crop_clean, cv2.COLOR_BGR2HSV)
 
-        # ── Step 3: Dynamic shoulder ROI (top 20 % – 60 %) ──────────
-        #   Covers cases where the person is leaning / mid-motion and the
-        #   tape appears lower than the rigid top-40% band.
-        roi_top    = int(crop_h * 0.20)
-        roi_bottom = int(crop_h * 0.60)
+        # ── Step 3: Shoulder ROI (top 20–60%) ────────────────────────
+        roi_top      = int(crop_h * 0.20)
+        roi_bottom   = int(crop_h * 0.60)
         shoulder_roi = hsv[roi_top:roi_bottom, :]
+        roi_area     = shoulder_roi.shape[0] * shoulder_roi.shape[1]
 
-        # ── Step 4: Widened HSV range for motion-blurred yellow ───────
-        #   Lower S bound reduced from 40 → 15 so blurred tape (whose
-        #   saturation is smeared) still registers.
+        # ── Step 4: HSV mask — wide S lower-bound for blur tolerance ─
         lower_yellow = np.array([ 5, 15, 80])
         upper_yellow = np.array([35, 255, 255])
+        mask_yellow  = cv2.inRange(shoulder_roi, lower_yellow, upper_yellow)
 
-        mask_yellow = cv2.inRange(shoulder_roi, lower_yellow, upper_yellow)
-
-        # Morphological cleanup: remove isolated noise specks
+        # ── Step 5: Morphological cleanup ────────────────────────────
         kernel      = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_OPEN,  kernel)
         mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, kernel)
 
         yellow_px = int(np.sum(mask_yellow > 0))
+        print(f"     🟡 Yellow Pixels in ROI: {yellow_px}px "
+              f"({100*yellow_px/max(roi_area,1):.1f}% of shoulder ROI)")
 
-        # ── Always log shoulder HSV diagnostics ──────────────────────
-        sh     = shoulder_roi[:, :, 0].flatten()
-        ss     = shoulder_roi[:, :, 1].flatten()
-        sv     = shoulder_roi[:, :, 2].flatten()
-        bright = sv > 30
-        if np.any(bright):
-            print(f"     🎨 Shoulder Area HSV:")
-            print(f"        Hue (H):        {np.mean(sh[bright]):6.1f} "
-                  f"(range: {np.min(sh[bright]):3d}-{np.max(sh[bright]):3d})")
-            print(f"        Saturation (S): {np.mean(ss[bright]):6.1f}")
-            print(f"        Value (V):      {np.mean(sv[bright]):6.1f}")
-            print(f"     🟡 Yellow Pixels:  {yellow_px}px (need {RADIUM_MIN_PX}px minimum)")
-        else:
-            print(f"     ⚫ Shoulder too dark (no bright pixels)")
-            print(f"     🟡 Yellow Pixels:  {yellow_px}px (need {RADIUM_MIN_PX}px minimum)")
+        if yellow_px == 0:
+            print(f"     ❌ No yellow pixels found in shoulder ROI")
+            return False
 
-        # Initialize debug data if debugging enabled
-        debug_data = None
+        # ── Step 6: Find individual yellow contours (blobs) ──────────
+        contours, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        print(f"     🔍 Found {len(contours)} yellow blob(s) — analysing each...")
+
+        # ── Step 7: Per-blob validation ───────────────────────────────
+        tape_blob_found = False
+        for i, cnt in enumerate(contours):
+            blob_area = cv2.contourArea(cnt)
+            if blob_area < 4:             # Skip sub-pixel noise
+                continue
+
+            # Area ratio relative to full crop (distance-invariant)
+            ratio = blob_area / crop_area
+
+            # Compactness: perimeter² / area — circles≈12.6, strips~20-40, scatter>>50
+            perimeter   = cv2.arcLength(cnt, True)
+            compactness = (perimeter ** 2) / blob_area if blob_area > 0 else 9999.0
+
+            # Extract pixels inside this blob only
+            blob_mask = np.zeros(mask_yellow.shape, dtype=np.uint8)
+            cv2.drawContours(blob_mask, [cnt], -1, 255, -1)
+            blob_s_vals = shoulder_roi[:, :, 1][blob_mask > 0]
+            blob_v_vals = shoulder_roi[:, :, 2][blob_mask > 0]
+
+            peak_s = int(np.max(blob_s_vals)) if len(blob_s_vals) > 0 else 0
+            peak_v = int(np.max(blob_v_vals)) if len(blob_v_vals) > 0 else 0
+            mean_s = float(np.mean(blob_s_vals)) if len(blob_s_vals) > 0 else 0.0
+
+            print(f"        Blob {i+1}: area={blob_area:.0f}px "
+                  f"ratio={ratio:.4f} compact={compactness:.1f} "
+                  f"peak_S={peak_s} peak_V={peak_v} mean_S={mean_s:.1f}")
+
+            # ── Ratio filter: must be in plausible tape size range ────
+            if ratio < BLOB_MIN_RATIO:
+                print(f"           → ❌ Too small (ratio {ratio:.4f} < {BLOB_MIN_RATIO})")
+                continue
+            if ratio > BLOB_MAX_RATIO:
+                print(f"           → ❌ Too large (ratio {ratio:.4f} > {BLOB_MAX_RATIO}) "
+                      f"— likely background/clothing")
+                continue
+
+            # ── Compactness filter: tape is a strip, not scattered ────
+            if compactness > BLOB_COMPACT_MAX:
+                print(f"           → ❌ Not compact (compact={compactness:.1f} > {BLOB_COMPACT_MAX})")
+                continue
+
+            # ── Peak saturation: must have at least some vivid pixels ─
+            if peak_s < BLOB_MIN_SAT:
+                print(f"           → ❌ Peak saturation too low ({peak_s} < {BLOB_MIN_SAT})")
+                continue
+
+            # ── Peak value: must be bright, not a shadow ──────────────
+            if peak_v < BLOB_MIN_VAL:
+                print(f"           → ❌ Peak value too low ({peak_v} < {BLOB_MIN_VAL})")
+                continue
+
+            # All checks passed — this blob is radium tape
+            print(f"           → ✅ TAPE BLOB CONFIRMED "
+                  f"(ratio={ratio:.4f}, compact={compactness:.1f}, "
+                  f"peak_S={peak_s}, peak_V={peak_v})")
+            tape_blob_found = True
+            break
+
+        # ── Step 8: Debug image if enabled ───────────────────────────
         if self.enable_debug:
             debug_data = {
-                'frame':                  frame_no,
-                'timestamp':              frame_no / fps,
-                'track_id':               tid,
-                'crop_width':             crop_w,
-                'crop_height':            crop_h,
-                'laplacian_variance':     round(lap_var, 2),
-                'shoulder_roi_top_pct':   0.20,
-                'shoulder_roi_bottom_pct':0.60,
-                'shoulder_yellow_pixels': yellow_px,
+                'frame':               frame_no,
+                'timestamp':           frame_no / fps,
+                'track_id':            tid,
+                'crop_width':          crop_w,
+                'crop_height':         crop_h,
+                'laplacian_variance':  round(lap_var, 2),
+                'yellow_pixels':       yellow_px,
+                'num_blobs':           len(contours),
+                'would_detect':        tape_blob_found,
+                'rejection_reason':    'DETECTED' if tape_blob_found else 'No valid tape blob',
             }
+            self._save_debug_image(crop_clean, hsv, mask_yellow,
+                                   debug_data, tid, frame_no, roi_top)
+            self.debug_log.append(debug_data)
 
-        # Require minimum pixels for valid radium tape detection
-        if yellow_px >= RADIUM_MIN_PX:
-            # Calculate mean saturation and value for validation
-            if yellow_px > 0:
-                # Get HSV statistics
-                h_vals = shoulder_roi[:,:,0][mask_yellow > 0]
-                s_vals = shoulder_roi[:,:,1][mask_yellow > 0]
-                v_vals = shoulder_roi[:,:,2][mask_yellow > 0]
-
-                max_s = int(np.max(s_vals))
-                max_v = int(np.max(v_vals))
-                mean_h = float(np.mean(h_vals))
-                mean_s = float(np.mean(s_vals))
-                mean_v = float(np.mean(v_vals))
-
-                print(f"\n     📊 Yellow Region Analysis:")
-                print(f"        Hue (H):        mean={mean_h:5.1f}")
-                print(f"        Saturation (S): mean={mean_s:5.1f}, max={max_s:3d}")
-                print(f"        Value (V):      mean={mean_v:5.1f}, max={max_v:3d}")
-                print(f"\n     🔍 Validation Checks:")
-
-                # Enhanced debug logging
-                if self.enable_debug and debug_data is not None:
-                    debug_data.update({
-                        'shoulder_h_min':  int(np.min(h_vals)),
-                        'shoulder_h_max':  int(np.max(h_vals)),
-                        'shoulder_h_mean': mean_h,
-                        'shoulder_h_std':  float(np.std(h_vals)),
-                        'shoulder_s_min':  int(np.min(s_vals)),
-                        'shoulder_s_max':  max_s,
-                        'shoulder_s_mean': mean_s,
-                        'shoulder_s_std':  float(np.std(s_vals)),
-                        'shoulder_v_min':  int(np.min(v_vals)),
-                        'shoulder_v_max':  max_v,
-                        'shoulder_v_mean': mean_v,
-                        'shoulder_v_std':  float(np.std(v_vals)),
-                        'meets_pixel_threshold': True,
-                    })
-
-                    # Pass roi_top so _save_debug_image can draw the correct ROI box
-                    self._save_debug_image(crop_clean, hsv, mask_yellow,
-                                           debug_data, tid, frame_no, roi_top)
-
-                # Validate it's bright enough (not shadows or dark objects)
-                if max_v < 150:
-                    print(f"        ❌ Brightness Check: FAILED (V={max_v} < 150)")
-                    print(f"           → Too dark, likely shadow")
-                    if self.enable_debug and debug_data is not None:
-                        debug_data.update({
-                            'meets_brightness_threshold': False,
-                            'meets_saturation_threshold': False,
-                            'meets_mean_saturation_threshold': False,
-                            'adaptive_threshold_used': 0,
-                            'area_classification': 'unknown',
-                            'would_detect': False,
-                            'rejection_reason': f"Too dark (V={max_v})"
-                        })
-                        self.debug_log.append(debug_data)
-                    return False
-
-                print(f"        ✅ Brightness Check: PASSED (V={max_v} >= 150)")
-
-                # Validate peak saturation — must have some bright pixels
-                if max_s < 150:
-                    print(f"        ❌ Peak Saturation Check: FAILED (S={max_s} < 150)")
-                    print(f"           → Not saturated enough for radium tape")
-                    if self.enable_debug and debug_data is not None:
-                        debug_data.update({
-                            'meets_brightness_threshold': True,
-                            'meets_saturation_threshold': False,
-                            'meets_mean_saturation_threshold': False,
-                            'adaptive_threshold_used': 0,
-                            'area_classification': 'unknown',
-                            'would_detect': False,
-                            'rejection_reason': f"Peak saturation too low (S={max_s})"
-                        })
-                        self.debug_log.append(debug_data)
-                    return False
-
-                print(f"        ✅ Peak Saturation Check: PASSED (S={max_s} >= 150)")
-
-                # Adaptive mean saturation threshold based on pixel count
-                # Small area (300-2000px) = likely tape → lenient threshold (mean_s >= 45)
-                # Large area (2000+px) = likely clothing → strict threshold (mean_s >= 75)
-                if yellow_px > 2000:
-                    mean_s_threshold = 75
-                    area_type = "large"
-
-                    # Additional check for large areas: max_s must be consistently high
-                    # Real tape + clothing: max_s >= 160 (tape is bright)
-                    # Pure clothing: max_s < 160 (no bright tape pixels)
-                    if max_s < 160:
-                        print(f"        ❌ Large Area Brightness Check: FAILED (max_s={max_s} < 160)")
-                        print(f"           → Large area but not bright enough for radium tape")
-                        if self.enable_debug and debug_data is not None:
-                            debug_data.update({
-                                'meets_brightness_threshold': True,
-                                'meets_saturation_threshold': False,
-                                'meets_mean_saturation_threshold': False,
-                                'adaptive_threshold_used': mean_s_threshold,
-                                'area_classification': area_type,
-                                'would_detect': False,
-                                'rejection_reason': f"Large area but max_s too low ({max_s} < 160)"
-                            })
-                            self.debug_log.append(debug_data)
-                        return False
-
-                    print(f"        ✅ Large Area Brightness Check: PASSED (max_s={max_s} >= 160)")
-                else:
-                    mean_s_threshold = 45
-                    area_type = "small"
-
-                print(f"        📏 Area Classification: {area_type.upper()} ({yellow_px}px)")
-                print(f"           → Threshold: mean_s >= {mean_s_threshold}")
-
-                if mean_s < mean_s_threshold:
-                    print(f"        ❌ Mean Saturation Check: FAILED (mean_s={mean_s:.1f} < {mean_s_threshold})")
-                    print(f"           → Likely yellow clothing, not radium tape")
-                    if self.enable_debug and debug_data is not None:
-                        debug_data.update({
-                            'meets_brightness_threshold': True,
-                            'meets_saturation_threshold': True,
-                            'meets_mean_saturation_threshold': False,
-                            'adaptive_threshold_used': mean_s_threshold,
-                            'area_classification': area_type,
-                            'would_detect': False,
-                            'rejection_reason': f"Mean saturation too low for {area_type} area (mean_s={mean_s:.0f} < {mean_s_threshold})"
-                        })
-                        self.debug_log.append(debug_data)
-                    return False
-
-                print(f"        ✅ Mean Saturation Check: PASSED (mean_s={mean_s:.1f} >= {mean_s_threshold})")
-                print(f"\n     ✅ ALL CHECKS PASSED → RADIUM TAPE DETECTED!")
-                print(f"\n{'🟢'*40}")
-                print(f"  ⚠️  EXEMPT MATCH DETECTED - PLEASE VERIFY!")
-                print(f"  ID: {tid} | Frame: {frame_no:05d} | Pixels: {yellow_px}px")
-                print(f"  Area: {area_type.upper()} | mean_s={mean_s:.1f} | max_s={max_s}")
-                print(f"{'🟢'*40}\n")
-                if self.enable_debug and debug_data is not None:
-                    # Determine which threshold was used
-                    if yellow_px > 2000:
-                        adaptive_threshold = 75
-                        area_class = "large"
-                    else:
-                        adaptive_threshold = 45
-                        area_class = "small"
-
-                    debug_data.update({
-                        'meets_brightness_threshold': True,
-                        'meets_saturation_threshold': True,
-                        'meets_mean_saturation_threshold': True,
-                        'adaptive_threshold_used': adaptive_threshold,
-                        'area_classification': area_class,
-                        'would_detect': True,
-                        'rejection_reason': 'DETECTED'
-                    })
-                    self.debug_log.append(debug_data)
-                return True
+        if tape_blob_found:
+            print(f"\n{'🟢'*40}")
+            print(f"  ⚠️  EXEMPT MATCH DETECTED — PLEASE VERIFY!")
+            print(f"  ID: {tid} | Frame: {frame_no:05d} | Yellow: {yellow_px}px")
+            print(f"{'🟢'*40}\n")
         else:
-            # Not enough pixels
-            print(f"     ❌ Insufficient yellow pixels: {yellow_px}px < {RADIUM_MIN_PX}px")
-            print(f"        → Not enough area for radium tape detection")
-            if self.enable_debug and debug_data is not None:
-                debug_data.update({
-                    'meets_pixel_threshold': False,
-                    'meets_brightness_threshold': False,
-                    'meets_saturation_threshold': False,
-                    'meets_mean_saturation_threshold': False,
-                    'adaptive_threshold_used': 0,
-                    'area_classification': 'too_small',
-                    'would_detect': False,
-                    'rejection_reason': f'Not enough pixels ({yellow_px})'
-                })
-                # Fill in missing HSV stats with zeros
-                for key in ['h', 's', 'v']:
-                    for stat in ['min', 'max', 'mean', 'std']:
-                        debug_data[f'shoulder_{key}_{stat}'] = 0
-                self.debug_log.append(debug_data)
+            print(f"     ❌ No blob passed all tape filters")
 
-        return False
+        return tape_blob_found
 
     def _save_debug_image(self, crop: np.ndarray, hsv: np.ndarray, mask_yellow: np.ndarray,
                           debug_data: dict, tid: int, frame_no: int, roi_top: int = 0):
@@ -755,7 +482,7 @@ class BusCounter:
         canvas[crop_h:2 * crop_h, 0:crop_w]              = h_vis
         canvas[crop_h:2 * crop_h, crop_w:2 * crop_w]     = s_vis
         canvas[crop_h:2 * crop_h, 2 * crop_w:3 * crop_w] = v_vis
-
+        
         # Labels
         labels = [
             (10,              20,           "Original"),
@@ -828,13 +555,12 @@ class BusCounter:
     def _update_track(self, tid, bbox, line_x, f_no, frame, fps: float = 30.0):
         x1, y1, x2, y2 = bbox.astype(int)
         raw_cx, raw_cy = (x1+x2)/2.0, (y1+y2)/2.0
-        event = None  # Initialize event variable
-
+        
         # Print frame header for better readability
         print(f"\n{'='*80}")
         print(f"  FRAME {f_no:05d} | ID {tid:2d} | Timestamp: {f_no/fps:.2f}s")
         print(f"{'='*80}")
-
+        
         if tid not in self.states:
             # ── Ghost re-link: try to recover a recently-lost track ───
             self._relink_ghost(tid, raw_cx, raw_cy, f_no)
@@ -842,39 +568,29 @@ class BusCounter:
         if tid not in self.states:
             # Still not found — create a genuinely new track
             side = self._get_side(raw_cx, line_x)
-            kf   = KalmanCentroid(raw_cx, raw_cy)
-            st   = TrackState(kalman=kf, cx=raw_cx, cy=raw_cy,
-                              last_seen=f_no)
-
-            # Critical: classify first-seen position
-            if self.live:
-                if side == "L":
-                    st.zone_state = "OUTSIDE"
-                    st.prev_side  = "L"
-                elif side == "R":
-                    st.zone_state = "INSIDE"
-                    st.prev_side  = "R"
-                else:
-                    # Live stream: allow a zone-start track to still count later
-                    st.zone_state = "ZONE"
-                    st.prev_side  = ""
-            else:
-                if side == "L":
-                    st.zone_state = "OUTSIDE"
-                    st.prev_side  = "L"
-                elif side == "R":
-                    # Already inside — can only count OUT, never IN
-                    st.zone_state = "INSIDE"
-                    st.prev_side  = "R"
-                else:
-                    # First seen in dead zone — cannot count in either direction
-                    st.zone_state = "SKIP"
-
+            st   = TrackState(kalman=KalmanCentroid(raw_cx, raw_cy), cx=raw_cx, cy=raw_cy, last_seen=f_no)
+            if side == "L":   st.zone_state, st.prev_side = "OUTSIDE", "L"
+            elif side == "R": st.zone_state, st.prev_side = "INSIDE",  "R"
+            else:             st.zone_state = "SKIP"
             self.states[tid] = st
-
         st = self.states[tid]
         st.last_seen = f_no
-        st.last_bbox = (x1, y1, x2, y2)
+
+        # ── EMA smoothing on bounding-box corners ─────────────────────
+        #   Removes per-frame YOLO jitter so the drawn box is visually stable.
+        sx1, sy1, sx2, sy2 = st.smooth_bbox
+        if sx1 == 0 and sy1 == 0 and sx2 == 0 and sy2 == 0:
+            # First detection — initialise smooth bbox to raw detection
+            st.smooth_bbox = (x1, y1, x2, y2)
+        else:
+            a = BOX_EMA_ALPHA
+            st.smooth_bbox = (
+                int(a * x1 + (1 - a) * sx1),
+                int(a * y1 + (1 - a) * sy1),
+                int(a * x2 + (1 - a) * sx2),
+                int(a * y2 + (1 - a) * sy2),
+            )
+        st.last_bbox = (x1, y1, x2, y2)  # raw bbox used for overlap checks
 
         # Scored exemption: only check when bbox is a clean single-person crop
         w_box, h_box = x2 - x1, y2 - y1
@@ -883,89 +599,87 @@ class BusCounter:
         overlapping = self._overlaps_other_tracks(tid, (x1, y1, x2, y2), f_no)
         tape_found = False
         skip_reason = ""
-
+        
         # Print bounding box info
         print(f"  📦 Bounding Box: {w_box:3d}x{h_box:3d} | Aspect Ratio: {ar:.2f}")
         print(f"  📍 Position: ({x1}, {y1}) → ({x2}, {y2})")
-
-        if merged:
-            skip_reason = "MERGED"
-            print(f"  ⚠️  Status: MERGED BOX (AR > {MERGE_AR_THRESH}) - Skipping tape detection")
-        elif overlapping:
-            skip_reason = "OVERLAP"
-            print(f"  ⚠️  Status: OVERLAPPING - Skipping tape detection")
-        else:
-            print(f"  ✓ Status: Clean single-person box - Running tape detection...")
-            print(f"  {'-'*76}")
-            crop = frame[max(0,y1):min(frame.shape[0],y2), max(0,x1):min(frame.shape[1],x2)]
-
-            # ── Blur gate: skip scoring on blurry crops ───────────────
-            blurry, lap_var = self._is_blurry(crop)
-            if blurry:
-                print(f"  ⚠️  Crop too blurry (Lap var={lap_var:.1f} < {BLUR_VAR_THRESH}) — score unchanged")
-                tape_found = False
-                # Do NOT push to vote window; do NOT update consec_miss
-            else:
-                tape_found = self._has_radium_tape(crop, tid, f_no, fps)
-                print(f"  {'-'*76}")
-
-                # ── Temporal vote window ──────────────────────────────
-                st.tape_votes.append(1 if tape_found else 0)
-                vote_hits = sum(st.tape_votes)
-                vote_confirmed = (len(st.tape_votes) >= VOTE_MIN_HITS and
-                                  vote_hits >= VOTE_MIN_HITS)
-
-                if tape_found:
-                    st.exempt_score = min(st.exempt_score + 3, EXEMPT_MAX)
-                    st.consec_miss  = 0
-                    print(f"  ✅ RADIUM TAPE DETECTED → Score +3 | Votes: {vote_hits}/{len(st.tape_votes)}")
-                else:
-                    # Only decay score after HYSTERESIS_MISS consecutive clear misses
-                    st.consec_miss += 1
-                    if st.consec_miss >= HYSTERESIS_MISS:
-                        st.exempt_score = max(st.exempt_score - 1, 0)
-                        print(f"  ❌ NO TAPE — {st.consec_miss} consec misses → Score -1 | "
-                              f"Votes: {vote_hits}/{len(st.tape_votes)}")
-                    else:
-                        print(f"  ❌ NO TAPE — consec miss {st.consec_miss}/{HYSTERESIS_MISS} "
-                              f"(score held) | Votes: {vote_hits}/{len(st.tape_votes)}")
-
-        # When merged/overlapping: score unchanged — don't penalize or reward
-        prev_exempt = st.exempt
-
-        # Grant exemption when score reaches threshold
-        # Revoke only when score hits 0 AND enough consecutive misses accumulated
-        #   → prevents a single blurry frame from stripping exemption
-        if st.exempt_score >= EXEMPT_CONFIRM:
-            st.exempt = True
-        elif st.exempt_score == 0 and st.consec_miss >= HYSTERESIS_MISS:
-            st.exempt = False
-
-        # Print exemption status
-        print(f"\n  📊 EXEMPTION STATUS:")
-        print(f"     Current Score: {st.exempt_score:2d}/{EXEMPT_CONFIRM} (max: {EXEMPT_MAX})")
-        print(f"     Exempt: {'YES ✓' if st.exempt else 'NO ✗'}")
-
-        if st.exempt and not prev_exempt:
-            print(f"\n{'⭐'*40}")
-            print(f"  🎉 🎉 🎉 [EXEMPT GRANTED] 🎉 🎉 🎉")
-            print(f"  ID {tid} | Score: {st.exempt_score}/{EXEMPT_CONFIRM}")
-            print(f"  ⚠️  VERIFY: Is this person wearing radium tape?")
-            print(f"{'⭐'*40}\n")
-        elif not st.exempt and prev_exempt:
-            print(f"\n{'⚠️ '*40}")
-            print(f"  ⚠️  [EXEMPT REVOKED] ID {tid} (score={st.exempt_score})")
-            print(f"{'⚠️ '*40}\n")
-
-        print(f"{'='*80}\n")
+        
+        # [EXEMPT BYPASS] Commented out tape detection and scoring logic
+        # if merged:
+        #     skip_reason = "MERGED"
+        #     print(f"  ⚠️  Status: MERGED BOX (AR > {MERGE_AR_THRESH}) - Skipping tape detection")
+        # elif overlapping:
+        #     skip_reason = "OVERLAP"
+        #     print(f"  ⚠️  Status: OVERLAPPING - Skipping tape detection")
+        # else:
+        #     print(f"  ✓ Status: Clean single-person box - Running tape detection...")
+        #     print(f"  {'-'*76}")
+        #     crop = frame[max(0,y1):min(frame.shape[0],y2), max(0,x1):min(frame.shape[1],x2)]
+        # 
+        #     # ── Blur gate: skip scoring on blurry crops ───────────────
+        #     blurry, lap_var = self._is_blurry(crop)
+        #     if blurry:
+        #         print(f"  ⚠️  Crop too blurry (Lap var={lap_var:.1f} < {BLUR_VAR_THRESH}) — score unchanged")
+        #         tape_found = False
+        #         # Do NOT push to vote window; do NOT update consec_miss
+        #     else:
+        #         tape_found = self._has_radium_tape(crop, tid, f_no, fps)
+        #         print(f"  {'-'*76}")
+        # 
+        #         # ── Temporal vote window ──────────────────────────────
+        #         st.tape_votes.append(1 if tape_found else 0)
+        #         vote_hits = sum(st.tape_votes)
+        #         vote_confirmed = (len(st.tape_votes) >= VOTE_MIN_HITS and
+        #                           vote_hits >= VOTE_MIN_HITS)
+        # 
+        #         if tape_found:
+        #             st.exempt_score = min(st.exempt_score + 3, EXEMPT_MAX)
+        #             st.consec_miss  = 0
+        #             print(f"  ✅ RADIUM TAPE DETECTED → Score +3 | Votes: {vote_hits}/{len(st.tape_votes)}")
+        #         else:
+        #             # Only decay score after HYSTERESIS_MISS consecutive clear misses
+        #             st.consec_miss += 1
+        #             if st.consec_miss >= HYSTERESIS_MISS:
+        #                 st.exempt_score = max(st.exempt_score - 1, 0)
+        #                 print(f"  ❌ NO TAPE — {st.consec_miss} consec misses → Score -1 | "
+        #                       f"Votes: {vote_hits}/{len(st.tape_votes)}")
+        #             else:
+        #                 print(f"  ❌ NO TAPE — consec miss {st.consec_miss}/{HYSTERESIS_MISS} "
+        #                       f"(score held) | Votes: {vote_hits}/{len(st.tape_votes)}")
+        
+        # [EXEMPT BYPASS] Commented out exemption status check and granting logic
+        # prev_exempt = st.exempt
+        # if st.exempt_score >= EXEMPT_CONFIRM:
+        #     st.exempt = True
+        # elif st.exempt_score == 0 and st.consec_miss >= HYSTERESIS_MISS:
+        #     st.exempt = False
+        # 
+        # # Print exemption status
+        # print(f"\n  📊 EXEMPTION STATUS:")
+        # print(f"     Current Score: {st.exempt_score:2d}/{EXEMPT_CONFIRM} (max: {EXEMPT_MAX})")
+        # print(f"     Exempt: {'YES ✓' if st.exempt else 'NO ✗'}")
+        # 
+        # if st.exempt and not prev_exempt:
+        #     print(f"\n{'⭐'*40}")
+        #     print(f"  🎉 🎉 🎉 [EXEMPT GRANTED] 🎉 🎉 🎉")
+        #     print(f"  ID {tid} | Score: {st.exempt_score}/{EXEMPT_CONFIRM}")
+        #     print(f"  ⚠️  VERIFY: Is this person wearing radium tape?")
+        #     print(f"{'⭐'*40}\n")
+        # elif not st.exempt and prev_exempt:
+        #     print(f"\n{'⚠️ '*40}")
+        #     print(f"  ⚠️  [EXEMPT REVOKED] ID {tid} (score={st.exempt_score})")
+        #     print(f"{'⚠️ '*40}\n")
+        # 
+        # print(f"{'='*80}\n")
 
         pcx, pcy = st.kalman.update(raw_cx, raw_cy)
         st.cx, st.cy = EMA_ALPHA * raw_cx + (1-EMA_ALPHA) * pcx, EMA_ALPHA * raw_cy + (1-EMA_ALPHA) * pcy
         st.trail.append((int(st.cx), int(st.cy)))
         if st.flash > 0: st.flash -= 1
-
-        if st.exempt: return
-
+        
+        # [EXEMPT BYPASS] Commented out early exit so everyone is counted
+        # if st.exempt: return
+        
         # SKIP recovery: if track was born in dead zone, recover once it moves to a clear side
         if st.zone_state == "SKIP":
             side = self._get_side(st.cx, line_x)
@@ -980,216 +694,30 @@ class BusCounter:
         side = self._get_side(st.cx, line_x)
         if side == "ZONE": st.zone_state, st.side_frames, st.debounce_side = "ZONE", 0, ""
         else:
-            # side is "L" or "R"
-            # ── Debounce: accumulate consecutive frames on this side ──────
-            if st.debounce_side != side:
-                st.debounce_side = side
-                st.side_frames   = 1
-            else:
-                st.side_frames  += 1
-
-
-            # Only commit transition after DEBOUNCE_N consecutive frames
+            if st.debounce_side != side: st.debounce_side, st.side_frames = side, 1
+            else: st.side_frames += 1
             if st.side_frames >= DEBOUNCE_N:
-                if side == "L":
-                    # Fix: clarify logic for live and non-live, and allow zone-start tracks to count if they traverse full path
-                    if (
-                        (self.live and st.zone_state in ("ZONE", "INSIDE") and st.prev_side in ("", "R"))
-                        or (not self.live and st.zone_state in ("ZONE", "INSIDE") and st.prev_side == "R")
-                    ):
-                        # Confirmed crossing: INSIDE → ZONE → OUTSIDE  =  EXIT
-                        if st.counted != "OUT":
-                            self.out_count += 1
-                            st.counted     = "OUT"
-                            st.flash       = FLASH_FRAMES
-                            event          = "OUT"
-                            self.events.append({
-                                "frame": f_no, "id": tid, "event": "OUT",
-                                "in": self.in_count, "out": self.out_count
-                            })
-                            print(f"[{f_no:05d}] ID {tid:3d} LEFT   | IN={self.in_count} OUT={self.out_count}")
-                            # ── Non-blocking API push ────────────────────
-                            if hasattr(self, 'api'):
-                                self.api.push(self.in_count, self.out_count)
-                    st.zone_state = "OUTSIDE"
-                    st.prev_side  = "L"
-
-                elif side == "R":
-                    if (
-                        (self.live and st.zone_state in ("ZONE", "OUTSIDE") and st.prev_side in ("", "L"))
-                        or (not self.live and st.zone_state in ("ZONE", "OUTSIDE") and st.prev_side == "L")
-                    ):
-                        # Confirmed crossing: OUTSIDE → ZONE → INSIDE  =  ENTER
-                        if st.counted != "IN":
-                            self.in_count += 1
-                            st.counted    = "IN"
-                            st.flash      = FLASH_FRAMES
-                            event         = "IN"
-                            self.events.append({
-                                "frame": f_no, "id": tid, "event": "IN",
-                                "in": self.in_count, "out": self.out_count
-                            })
-                            print(f"[{f_no:05d}] ID {tid:3d} ENTERED| IN={self.in_count} OUT={self.out_count}")
-                            # ── Non-blocking API push ────────────────────
-                            if hasattr(self, 'api'):
-                                self.api.push(self.in_count, self.out_count)
-                    st.zone_state = "INSIDE"
-                    st.prev_side  = "R"
-
-        return event
-
-    # ── drawing ───────────────────────────────────────────────────────────
-
-    def _draw_zones(self, frame: np.ndarray, line_x: int) -> np.ndarray:
-        h = frame.shape[0]
-        ov = frame.copy()
-
-        # Left zone (outside) — very subtle blue tint
-        cv2.rectangle(ov, (0, 0), (line_x - DEAD_ZONE_PX, h), (180, 60, 0), -1)
-        # Right zone (inside bus) — very subtle green tint
-        cv2.rectangle(ov, (line_x + DEAD_ZONE_PX, 0), (frame.shape[1], h), (0, 140, 0), -1)
-        frame = cv2.addWeighted(ov, 0.06, frame, 0.94, 0)
-
-        # Dead zone strip — yellow tint
-        ov2 = frame.copy()
-        cv2.rectangle(ov2, (line_x - DEAD_ZONE_PX, 0),
-                      (line_x + DEAD_ZONE_PX, h), (0, 200, 255), -1)
-        frame = cv2.addWeighted(ov2, 0.18, frame, 0.82, 0)
-
-        # Lines
-        cv2.line(frame, (line_x, 0), (line_x, h), COL_LINE, 2)
-        cv2.line(frame, (line_x - DEAD_ZONE_PX, 0),
-                 (line_x - DEAD_ZONE_PX, h), (0, 180, 255), 1)
-        cv2.line(frame, (line_x + DEAD_ZONE_PX, 0),
-                 (line_x + DEAD_ZONE_PX, h), (0, 180, 255), 1)
-
-        # Labels
-        cv2.putText(frame, "OUTSIDE", (10, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 255), 1, cv2.LINE_AA)
-        cv2.putText(frame, "INSIDE", (line_x + DEAD_ZONE_PX + 6, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 255, 80), 1, cv2.LINE_AA)
-        cv2.putText(frame, "ZONE", (line_x - DEAD_ZONE_PX + 4, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1, cv2.LINE_AA)
-        return frame
-
-    def _draw_tracks(self, frame: np.ndarray, dets: sv.Detections) -> np.ndarray:
-        if dets.tracker_id is None:
-            return frame
-
-        for bbox, tid in zip(dets.xyxy, dets.tracker_id):
-            tid = int(tid)
-            st  = self.states.get(tid)
-            if st is None:
-                continue
-
-            x1, y1, x2, y2 = bbox.astype(int)
-
-            # ── Trail ─────────────────────────────────────────────────────
-            pts = list(st.trail)
-            if len(pts) > 1:
-                for j in range(1, len(pts)):
-                    t     = j / max(len(pts) - 1, 1)
-                    blue  = int(255 * (1 - t))
-                    green = int(200 * t)
-                    red   = int(120 * t)
-                    cv2.line(frame, pts[j-1], pts[j], (blue, green, red), 2,
-                             cv2.LINE_AA)
-
-            # ── Bounding box color ─────────────────────────────────────────
-            if st.exempt:
-                col = COL_EXEMPT
-            elif st.zone_state == "SKIP":
-                col = COL_BOX_SKIP
-            elif st.flash > 0:
-                col = COL_BOX_FLASH      # CYAN on count event
-            else:
-                col = COL_BOX_NORM       # Orange normally
-
-            thick = 3 if st.flash > 0 else 2
-            cv2.rectangle(frame, (x1, y1), (x2, y2), col, thick)
-
-            # ── Centroid dot ───────────────────────────────────────────────
-            cx, cy = int(st.cx), int(st.cy)
-            cv2.circle(frame, (cx, cy), 5, (255, 255, 255), -1)
-            cv2.circle(frame, (cx, cy), 5, col, 2)
-
-            # ── Label ─────────────────────────────────────────────────────
-            if st.exempt:
-                tag_col = COL_EXEMPT
-                tag     = f"#{tid} EXEMPT"
-            elif st.counted == "IN":
-                tag_col = COL_IN_TEXT
-                tag     = f"#{tid} IN"
-            elif st.counted == "OUT":
-                tag_col = COL_OUT_TEXT
-                tag     = f"#{tid} OUT"
-            elif st.zone_state == "SKIP":
-                tag_col = COL_BOX_SKIP
-                tag     = f"#{tid} skip"
-            else:
-                tag_col = (200, 200, 200)
-                tag     = f"#{tid} {st.zone_state[:3]}"
-
-            cv2.putText(frame, tag, (x1, y1 - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, tag_col, 1, cv2.LINE_AA)
-
-        return frame
-
-    def _draw_dashboard(self, frame: np.ndarray, frame_no: int,
-                        fps: float) -> np.ndarray:
-        h, w   = frame.shape[:2]
-        dw, dh = 220, 130
-        margin = 14
-        x1 = w - dw - margin
-        y1 = margin
-
-        ov = frame.copy()
-        cv2.rectangle(ov, (x1, y1), (x1 + dw, y1 + dh), (12, 12, 12), -1)
-        frame = cv2.addWeighted(ov, 0.70, frame, 0.30, 0)
-
-        # Green accent bar
-        cv2.rectangle(frame, (x1, y1), (x1 + dw, y1 + 3), (0, 200, 80), -1)
-
-        inside = max(0, self.in_count - self.out_count)
-        rows   = [
-            ("ENTERED", self.in_count,  COL_IN_TEXT),
-            ("LEFT",    self.out_count, COL_OUT_TEXT),
-            ("INSIDE",  inside,         (80, 220, 255)),
-        ]
-        for i, (label, val, col) in enumerate(rows):
-            y = y1 + 34 + i * 32
-            cv2.putText(frame, f"{label}:", (x1 + 10, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (160, 160, 160), 1, cv2.LINE_AA)
-            cv2.putText(frame, str(val), (x1 + 148, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.62, col, 2, cv2.LINE_AA)
-
-        # Frame counter
-        ts = f"f{frame_no}  {frame_no/fps:.1f}s"
-        cv2.putText(frame, ts, (x1 + 10, y1 + dh - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (80, 80, 80), 1, cv2.LINE_AA)
-        return frame
-
-    # ── CSV ───────────────────────────────────────────────────────────────
-
-    def _save_csv(self, path: str):
-        with open(path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["frame", "timestamp", "id",
-                                               "event", "in", "out", "inside"])
-            w.writeheader()
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            for ev in self.events:
-                w.writerow({
-                    "frame":     ev["frame"],
-                    "timestamp": ts,
-                    "id":        ev["id"],
-                    "event":     ev["event"],
-                    "in":        ev["in"],
-                    "out":       ev["out"],
-                    "inside":    ev["in"] - ev["out"],
-                })
-        print(f"CSV saved: {path}")
-
-    # ── main loop ─────────────────────────────────────────────────────────
+                if side == "L" and st.zone_state == "ZONE" and st.prev_side == "R":
+                    if st.counted != "OUT":
+                        self.out_count += 1
+                        st.counted, st.flash = "OUT", FLASH_FRAMES
+                        self.events.append({"frame": f_no, "id": tid, "event": "OUT", "in": self.in_count, "out": self.out_count})
+                        print(f"\n{'🚪'*40}")
+                        print(f"  🚶 PERSON LEFT THE BUS")
+                        print(f"     ID: {tid} | Frame: {f_no:05d} | Time: {f_no/fps:.2f}s")
+                        print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
+                        print(f"{'🚪'*40}\n")
+                elif side == "R" and st.zone_state == "ZONE" and st.prev_side == "L":
+                    if st.counted != "IN":
+                        self.in_count += 1
+                        st.counted, st.flash = "IN", FLASH_FRAMES
+                        self.events.append({"frame": f_no, "id": tid, "event": "IN", "in": self.in_count, "out": self.out_count})
+                        print(f"\n{'🚪'*40}")
+                        print(f"  🚶 PERSON ENTERED THE BUS")
+                        print(f"     ID: {tid} | Frame: {f_no:05d} | Time: {f_no/fps:.2f}s")
+                        print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
+                        print(f"{'🚪'*40}\n")
+                st.zone_state, st.prev_side = ("OUTSIDE" if side=="L" else "INSIDE"), side
 
     def process(self):
         cap = cv2.VideoCapture(self.video_path)
@@ -1216,15 +744,6 @@ class BusCounter:
                 track_args["classes"] = [0]
 
             res = self.model.track(frame, **track_args)[0]
-            
-            # Convert results to supervision Detections for drawing
-            dets = sv.Detections(
-                xyxy=res.boxes.xyxy.cpu().numpy(),
-                confidence=res.boxes.conf.cpu().numpy() if res.boxes.conf is not None else None,
-                class_id=res.boxes.cls.cpu().numpy().astype(int) if res.boxes.cls is not None else None,
-                tracker_id=res.boxes.id.cpu().numpy().astype(int) if res.boxes.id is not None else None,
-            )
-            
             if res.boxes.id is not None:
                 for b, tid in zip(res.boxes.xyxy.cpu().numpy(),
                                   res.boxes.id.cpu().numpy().astype(int)):
@@ -1247,16 +766,12 @@ class BusCounter:
                     if f_no - g_st.last_seen < GHOST_TIMEOUT * 2
                 }
 
-            # ── Draw ──────────────────────────────────────────────────
-            frame = self._draw_zones(frame, line_x)
-            frame = self._draw_tracks(frame, dets)
-            frame = self._draw_dashboard(frame, f_no, FPS)
+            # Draw UI and write frame
+            frame = self._draw_ui(frame, line_x, res, f_no)
             writer.write(frame)
-
-            if not self.no_preview:
-                cv2.imshow("Bus Counter v3", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+            cv2.imshow("Bus Counter", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
         cap.release()
         writer.release()
@@ -1278,78 +793,113 @@ class BusCounter:
                 w.writerows(self.debug_log)
             print(f"\n[DEBUG] CSV log saved: {debug_csv_path} ({len(self.debug_log)} entries)")
 
-    def _draw_ui(self, frame, line_x, res):
+    def _draw_ui(self, frame, line_x, res, f_no: int = 0):
         h, w = frame.shape[:2]
-        # Zones
+
+        # ── Zone overlays ─────────────────────────────────────────────
         ov = frame.copy()
         cv2.rectangle(ov, (0, 0), (line_x - DEAD_ZONE_PX, h), (180, 60, 0), -1)
         cv2.rectangle(ov, (line_x + DEAD_ZONE_PX, 0), (w, h), (0, 140, 0), -1)
         frame = cv2.addWeighted(ov, 0.06, frame, 0.94, 0)
         cv2.line(frame, (line_x, 0), (line_x, h), COL_LINE, 2)
-        # Dashboard
-        x1, y1, dw, dh = w - 220, 20, 200, 120
+
+        # ── Dashboard ─────────────────────────────────────────────────
+        dx1, dy1, dw, dh = w - 220, 20, 200, 120
         ov2 = frame.copy()
-        cv2.rectangle(ov2, (x1, y1), (x1+dw, y1+dh), (15,15,15), -1)
+        cv2.rectangle(ov2, (dx1, dy1), (dx1 + dw, dy1 + dh), (15, 15, 15), -1)
         frame = cv2.addWeighted(ov2, 0.7, frame, 0.3, 0)
-        cv2.rectangle(frame, (x1, y1), (x1+dw, y1+3), (0,200,80), -1)
-        rows = [("ENTERED", self.in_count, COL_IN_TEXT), ("LEFT", self.out_count, COL_OUT_TEXT), ("INSIDE", max(0, self.in_count-self.out_count), (80,220,255))]
-        for i, (l, v, c) in enumerate(rows):
-            cv2.putText(frame, f"{l}: {v}", (x1+15, y1+35+i*30), 0, 0.55, c, 2)
-        # Tracks
+        cv2.rectangle(frame, (dx1, dy1), (dx1 + dw, dy1 + 3), (0, 200, 80), -1)
+        rows = [
+            ("ENTERED", self.in_count,                           COL_IN_TEXT),
+            ("LEFT",    self.out_count,                          COL_OUT_TEXT),
+            ("INSIDE",  max(0, self.in_count - self.out_count),  (80, 220, 255)),
+        ]
+        for i, (lbl, val, col) in enumerate(rows):
+            cv2.putText(frame, f"{lbl}: {val}", (dx1 + 15, dy1 + 35 + i * 30),
+                        0, 0.55, col, 2)
+
+        # ── Collect IDs currently detected this frame ─────────────────
+        detected_ids = set()
         if res.boxes.id is not None:
-            for b, tid in zip(res.boxes.xyxy.cpu().numpy(), res.boxes.id.cpu().numpy().astype(int)):
+            detected_ids = set(res.boxes.id.cpu().numpy().astype(int).tolist())
+
+        # ── Draw active detection boxes (EMA-smoothed) ────────────────
+        if res.boxes.id is not None:
+            for b, tid in zip(res.boxes.xyxy.cpu().numpy(),
+                              res.boxes.id.cpu().numpy().astype(int)):
                 st = self.states.get(tid)
-                if not st: continue
-                x1, y1, x2, y2 = b.astype(int)
-                col = COL_EXEMPT if st.exempt else (COL_BOX_SKIP if st.zone_state == "SKIP" else (COL_BOX_FLASH if st.flash > 0 else COL_BOX_NORM))
-                cv2.rectangle(frame, (x1, y1), (x2, y2), col, (3 if st.flash > 0 else 2))
-                cv2.putText(frame, f"#{tid}" + (" EXEMPT" if st.exempt else ""), (x1, y1-10), 0, 0.5, col, 1)
+                if not st:
+                    continue
+
+                # Use EMA-smoothed corners for drawing
+                bx1, by1, bx2, by2 = st.smooth_bbox
+
+                col = (COL_EXEMPT     if st.exempt
+                       else COL_BOX_SKIP  if st.zone_state == "SKIP"
+                       else COL_BOX_FLASH if st.flash > 0
+                       else COL_BOX_NORM)
+                thickness = 3 if st.flash > 0 else 2
+                cv2.rectangle(frame, (bx1, by1), (bx2, by2), col, thickness)
+                label = f"#{tid}" + (" EXEMPT" if st.exempt else "")
+                cv2.putText(frame, label, (bx1, by1 - 10), 0, 0.5, col, 1)
+
+                # Trail
                 pts = list(st.trail)
                 for j in range(1, len(pts)):
-                    t = j / max(len(pts)-1, 1)
-                    cv2.line(frame, pts[j-1], pts[j], (int(255*(1-t)), int(200*t), int(120*t)), 2)
+                    t = j / max(len(pts) - 1, 1)
+                    cv2.line(frame, pts[j - 1], pts[j],
+                             (int(255 * (1 - t)), int(200 * t), int(120 * t)), 2)
+
+        # ── Ghost box extrapolation ───────────────────────────────────
+        #   For tracks not detected this frame but seen recently, draw a
+        #   semi-transparent predicted box using the Kalman prediction.
+        #   This prevents the visual "box disappearing" between detections.
+        for tid, st in self.states.items():
+            if tid in detected_ids:
+                continue  # Already drawn above
+            frames_lost = f_no - st.last_seen
+            if frames_lost < 1 or frames_lost > GHOST_BOX_FRAMES:
+                continue
+
+            # Use the last smooth bbox centred on predicted position
+            bx1, by1, bx2, by2 = st.smooth_bbox
+            bw = max(bx2 - bx1, 1)
+            bh = max(by2 - by1, 1)
+
+            # Predict new centroid from Kalman
+            pred_cx, pred_cy = st.kalman.predict()
+            pred_cx = int(np.clip(pred_cx, bw // 2, w - bw // 2))
+            pred_cy = int(np.clip(pred_cy, bh // 2, h - bh // 2))
+
+            gx1 = pred_cx - bw // 2
+            gy1 = pred_cy - bh // 2
+            gx2 = pred_cx + bw // 2
+            gy2 = pred_cy + bh // 2
+
+            # Fade opacity with age (more transparent = older)
+            alpha  = max(0.15, 0.6 - frames_lost * 0.07)
+            ghost  = frame.copy()
+            g_col  = COL_EXEMPT if st.exempt else (180, 180, 60)
+            cv2.rectangle(ghost, (gx1, gy1), (gx2, gy2), g_col, 2)
+            cv2.putText(ghost, f"#{tid} ?", (gx1, gy1 - 10), 0, 0.45, g_col, 1)
+            frame = cv2.addWeighted(ghost, alpha, frame, 1 - alpha, 0)
+
         return frame
 
-# ═══════════════════════════════════════════════════════
-#  ENTRY POINT
-# ═══════════════════════════════════════════════════════
-def main():
-    global LINE_RATIO
-
-    p = argparse.ArgumentParser(description="Bus Passenger Counter v3 + API Push")
-    p.add_argument("--source",  default="counting.mp4",   help="Input video")
-    p.add_argument("--output",  default="result_v3.mp4",  help="Output video")
-    p.add_argument("--model",   default="yolov8s.pt",     help="YOLO weights")
-    p.add_argument("--line",    type=float, default=LINE_RATIO,
-                   help="Trigger line fraction of frame width (default 0.50)")
-    p.add_argument("--exempt",  default="",
-                   help="Path to exempt_embedding.npy (skip counting this person)")
-    p.add_argument("--no-preview", action="store_true",
-                   help="Disable live preview (faster headless runs)")
-    p.add_argument("--live", action="store_true",
-                   help="Live stream mode: assume all tracks start outside")
-    p.add_argument("--debug", action="store_true",
-                   help="Enable detailed HSV debugging (saves CSV + images)")
-    p.add_argument("--head-detect", action="store_true",
-                   help="Use CrowdHuman head detection model (better for top-down views)")
-    p.add_argument("--visdrone", action="store_true",
-                   help="Use VisDrone model (optimized for overhead/drone camera views)")
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--source",     default="testing.mp4")
+    p.add_argument("--output",     default="result_v4.mp4")
+    p.add_argument("--model",      default="yolov8x.pt",  help="Path to YOLO model weights")
+    p.add_argument("--debug",      action="store_true",   help="Enable detailed HSV debugging (saves CSV + images)")
+    p.add_argument("--head-detect",action="store_true",   help="Use CrowdHuman-trained model for head/partial body detection")
+    p.add_argument("--visdrone",   action="store_true",   help="Auto-download and use VisDrone-pretrained YOLOv8n (best for top-down views)")
     args = p.parse_args()
-
-    LINE_RATIO = args.line
-
-    counter = BusCounter(
-        video_path   = args.source,
+    BusCounter(
+        args.source,
         model_path   = args.model,
         output_path  = args.output,
         enable_debug = args.debug,
         head_detect  = args.head_detect,
         visdrone     = args.visdrone,
-        no_preview   = args.no_preview,
-        live         = args.live,
-    )
-    counter.process()
-
-
-if __name__ == "__main__":
-    main()
+    ).process()
