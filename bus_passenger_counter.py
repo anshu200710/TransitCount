@@ -67,7 +67,7 @@ BLOB_COMPACT_MAX = 25.0   # Max (perimeter² / area) compactness — tape is com
 # Ghost box extrapolation
 #   When a track is lost for ≤ GHOST_BOX_FRAMES frames, draw its Kalman-predicted
 #   box on screen so the visual never disappears between detections.
-GHOST_BOX_FRAMES = 8      # Max frames to show a ghost box (after this it fades out)
+GHOST_BOX_FRAMES = 45      # Synced with track_buffer: keeps box visible as long as tracker is alive
 
 # Bounding-box EMA smoothing
 #   EMA applied to all 4 corners to remove per-frame YOLO jitter.
@@ -184,26 +184,11 @@ class BusCounter:
 
     def _ensure_visdrone_model(self) -> str:
         """
-        Download a YOLOv8 model pre-trained on VisDrone (top-down drone/CCTV dataset).
-        VisDrone contains overhead pedestrian imagery — far more suitable than the
-        standard COCO-trained model for bus-door top-down camera views.
-        Falls back to yolov8s-visdrone if the nano variant is unavailable.
+        Use YOLOv8x (Extra Large) for highest accuracy.
+        Native VisDrone support in YOLOv8x is best achieved by starting with
+        the robust COCO-trained weights which are highly capable.
         """
-        import urllib.request
-        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolov8n_visdrone.pt")
-        if not os.path.exists(model_path):
-            # Official Ultralytics VisDrone fine-tuned weights
-            url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n-visdrone.pt"
-            print(f"[VISDRONE] Downloading VisDrone model from {url}...")
-            try:
-                urllib.request.urlretrieve(url, model_path)
-                print(f"[VISDRONE] Saved to {model_path}")
-            except Exception as e:
-                print(f"[VISDRONE] Download failed ({e}). Falling back to yolov8s.pt")
-                return "yolov8s.pt"
-        else:
-            print(f"[VISDRONE] Using existing model: {model_path}")
-        return model_path
+        return "yolov8x.pt"
 
     def _ensure_bytetrack_yaml(self):
         """
@@ -697,7 +682,13 @@ class BusCounter:
             if st.debounce_side != side: st.debounce_side, st.side_frames = side, 1
             else: st.side_frames += 1
             if st.side_frames >= DEBOUNCE_N:
-                if side == "L" and st.zone_state == "ZONE" and st.prev_side == "R":
+                # ── Counting Logic: Detect Crossings ──────────────────
+                # 1. Standard crossing (Side A -> ZONE -> Side B)
+                # 2. Direct crossing (Side A -> Side B) - happens with fast movement
+                crossed_in  = (side == "R" and st.prev_side == "L")
+                crossed_out = (side == "L" and st.prev_side == "R")
+
+                if crossed_out:
                     if st.counted != "OUT":
                         self.out_count += 1
                         st.counted, st.flash = "OUT", FLASH_FRAMES
@@ -707,7 +698,7 @@ class BusCounter:
                         print(f"     ID: {tid} | Frame: {f_no:05d} | Time: {f_no/fps:.2f}s")
                         print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
                         print(f"{'🚪'*40}\n")
-                elif side == "R" and st.zone_state == "ZONE" and st.prev_side == "L":
+                elif crossed_in:
                     if st.counted != "IN":
                         self.in_count += 1
                         st.counted, st.flash = "IN", FLASH_FRAMES
@@ -717,7 +708,10 @@ class BusCounter:
                         print(f"     ID: {tid} | Frame: {f_no:05d} | Time: {f_no/fps:.2f}s")
                         print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
                         print(f"{'🚪'*40}\n")
-                st.zone_state, st.prev_side = ("OUTSIDE" if side=="L" else "INSIDE"), side
+                
+                # Update state for next frame
+                st.zone_state = ("OUTSIDE" if side=="L" else "INSIDE")
+                st.prev_side = side
 
     def process(self):
         cap = cv2.VideoCapture(self.video_path)
