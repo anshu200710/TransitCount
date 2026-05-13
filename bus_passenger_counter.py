@@ -17,6 +17,9 @@ import cv2
 import numpy as np
 import supervision as sv
 from ultralytics import YOLO
+import threading
+import queue
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
@@ -551,12 +554,11 @@ class BusCounter:
             self._relink_ghost(tid, raw_cx, raw_cy, f_no)
 
         if tid not in self.states:
-            # Still not found — create a genuinely new track
-            side = self._get_side(raw_cx, line_x)
-            st   = TrackState(kalman=KalmanCentroid(raw_cx, raw_cy), cx=raw_cx, cy=raw_cy, last_seen=f_no)
-            if side == "L":   st.zone_state, st.prev_side = "OUTSIDE", "L"
-            elif side == "R": st.zone_state, st.prev_side = "INSIDE",  "R"
-            else:             st.zone_state = "SKIP"
+            st = TrackState(kalman=KalmanCentroid(raw_cx, raw_cy), cx=raw_cx, cy=raw_cy, last_seen=f_no)
+            # [REMOVED SKIP] Initialize side immediately even if in the dead zone
+            initial_side = "L" if raw_cx < line_x else "R"
+            st.prev_side = initial_side
+            st.zone_state = "OUTSIDE" if initial_side == "L" else "INSIDE"
             self.states[tid] = st
         st = self.states[tid]
         st.last_seen = f_no
@@ -665,111 +667,153 @@ class BusCounter:
         # [EXEMPT BYPASS] Commented out early exit so everyone is counted
         # if st.exempt: return
         
-        # SKIP recovery: if track was born in dead zone, recover once it moves to a clear side
-        if st.zone_state == "SKIP":
-            side = self._get_side(st.cx, line_x)
-            if side == "L":
-                st.zone_state, st.prev_side = "OUTSIDE", "L"
-                print(f"  [SKIP\u2192RECOVERED] ID {tid} moved to LEFT side")
-            elif side == "R":
-                st.zone_state, st.prev_side = "INSIDE", "R"
-                print(f"  [SKIP\u2192RECOVERED] ID {tid} moved to RIGHT side")
-            return  # Don't count this frame, just recover state
+        # [SKIP LOGIC REMOVED] All tracks are processed immediately
 
-        side = self._get_side(st.cx, line_x)
-        if side == "ZONE": st.zone_state, st.side_frames, st.debounce_side = "ZONE", 0, ""
+        # ── Counting Logic: Detect Crossings ──────────────────
+        # Use strict line-side for counting to avoid "Dead Zone" misses
+        curr_side = "L" if st.cx < line_x else "R"
+        
+        # Still update zone_state for visuals
+        visual_side = self._get_side(st.cx, line_x)
+        if visual_side == "ZONE":
+            st.zone_state = "ZONE"
         else:
-            if st.debounce_side != side: st.debounce_side, st.side_frames = side, 1
-            else: st.side_frames += 1
-            if st.side_frames >= DEBOUNCE_N:
-                # ── Counting Logic: Detect Crossings ──────────────────
-                # 1. Standard crossing (Side A -> ZONE -> Side B)
-                # 2. Direct crossing (Side A -> Side B) - happens with fast movement
-                crossed_in  = (side == "R" and st.prev_side == "L")
-                crossed_out = (side == "L" and st.prev_side == "R")
+            st.zone_state = "OUTSIDE" if visual_side == "L" else "INSIDE"
 
-                if crossed_out:
-                    if st.counted != "OUT":
-                        self.out_count += 1
-                        st.counted, st.flash = "OUT", FLASH_FRAMES
-                        self.events.append({"frame": f_no, "id": tid, "event": "OUT", "in": self.in_count, "out": self.out_count})
-                        print(f"\n{'🚪'*40}")
-                        print(f"  🚶 PERSON LEFT THE BUS")
-                        print(f"     ID: {tid} | Frame: {f_no:05d} | Time: {f_no/fps:.2f}s")
-                        print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
-                        print(f"{'🚪'*40}\n")
-                elif crossed_in:
-                    if st.counted != "IN":
-                        self.in_count += 1
-                        st.counted, st.flash = "IN", FLASH_FRAMES
-                        self.events.append({"frame": f_no, "id": tid, "event": "IN", "in": self.in_count, "out": self.out_count})
-                        print(f"\n{'🚪'*40}")
-                        print(f"  🚶 PERSON ENTERED THE BUS")
-                        print(f"     ID: {tid} | Frame: {f_no:05d} | Time: {f_no/fps:.2f}s")
-                        print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
-                        print(f"{'🚪'*40}\n")
-                
-                # Update state for next frame
-                st.zone_state = ("OUTSIDE" if side=="L" else "INSIDE")
-                st.prev_side = side
+        # Debounce logic remains to prevent jitter, but uses the strict side
+        if st.debounce_side != curr_side:
+            st.debounce_side, st.side_frames = curr_side, 1
+        else:
+            st.side_frames += 1
+            
+        if st.side_frames >= DEBOUNCE_N:
+            # Detect transitions across the strict center line
+            crossed_in  = (curr_side == "R" and st.prev_side == "L")
+            crossed_out = (curr_side == "L" and st.prev_side == "R")
+
+            if crossed_out:
+                if st.counted != "OUT":
+                    self.out_count += 1
+                    st.counted, st.flash = "OUT", FLASH_FRAMES
+                    self.events.append({"frame": f_no, "id": tid, "event": "OUT", "in": self.in_count, "out": self.out_count})
+                    print(f"\n{'🚪'*40}")
+                    print(f"  🚶 PERSON LEFT THE BUS")
+                    print(f"     ID: {tid} | Frame: {f_no:05d} | Time: {f_no/fps:.2f}s")
+                    print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
+                    print(f"{'🚪'*40}\n")
+            elif crossed_in:
+                if st.counted != "IN":
+                    self.in_count += 1
+                    st.counted, st.flash = "IN", FLASH_FRAMES
+                    self.events.append({"frame": f_no, "id": tid, "event": "IN", "in": self.in_count, "out": self.out_count})
+                    print(f"\n{'🚪'*40}")
+                    print(f"  🚶 PERSON ENTERED THE BUS")
+                    print(f"     ID: {tid} | Frame: {f_no:05d} | Time: {f_no/fps:.2f}s")
+                    print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
+                    print(f"{'🚪'*40}\n")
+            
+            # Update state for next frame
+            st.prev_side = curr_side
 
     def process(self):
         cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            print(f"ERROR: Cannot open source: {self.video_path}")
+            return
+
         W, H, FPS = int(cap.get(3)), int(cap.get(4)), cap.get(5) or 30.0
         line_x = int(W * LINE_RATIO)
         writer  = cv2.VideoWriter(self.output_path, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (W, H))
-        f_no    = 0
+        
+        # ── Asynchronous Reader Setup ────────────────────────────────
+        # We use a thread to constantly pull frames from the stream.
+        # This prevents RTMP timeouts by ensuring the network socket is
+        # always being emptied, regardless of how slow the AI is.
+        frame_queue = queue.Queue(maxsize=1500)  # ~50 seconds buffer at 30fps
+        stop_event = threading.Event()
 
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            f_no += 1
+        def reader_thread():
+            f_count = 0
+            while not stop_event.is_set():
+                ret, frame = cap.read()
+                if not ret:
+                    frame_queue.put(None)  # Signal end of stream
+                    break
+                f_count += 1
+                # Block if queue is full to prevent memory explosion, 
+                # but 1500 frames is a very large safety margin.
+                frame_queue.put((f_count, frame))
 
-            track_args = dict(
-                conf    = CONF_THRESH,
-                iou     = IOU_THRESH,
-                verbose = False,
-                tracker = TRACKER_CONFIG,
-                persist = True,
-            )
-            # VisDrone model uses class 1 (pedestrian); CrowdHuman/standard use class 0
-            if not self.head_detect:
-                track_args["classes"] = [0]
+        reader = threading.Thread(target=reader_thread, daemon=True)
+        reader.start()
+        print(f"[STREAM] Started async reader for {self.video_path}")
 
-            res = self.model.track(frame, **track_args)[0]
-            if res.boxes.id is not None:
-                for b, tid in zip(res.boxes.xyxy.cpu().numpy(),
-                                  res.boxes.id.cpu().numpy().astype(int)):
-                    self._update_track(tid, b, line_x, f_no, frame, FPS)
+        try:
+            while True:
+                # Get the next frame from the queue
+                try:
+                    item = frame_queue.get(timeout=10.0) # 10s timeout if stream hangs
+                except queue.Empty:
+                    print("[WARN] Stream data delayed - waiting...")
+                    continue
 
-            # Every 90 frames: move timed-out active tracks into the ghost pool
-            # rather than deleting them outright, so _relink_ghost can recover them.
-            if f_no % 90 == 0:
-                alive, expired = {}, {}
-                for t_id, s in self.states.items():
-                    if f_no - s.last_seen < GHOST_TIMEOUT:
-                        alive[t_id] = s
-                    else:
-                        expired[t_id] = s
-                self.states = alive
-                # Merge expired into ghost pool; prune very old ghosts
-                self._ghost_pool.update(expired)
-                self._ghost_pool = {
-                    g_id: g_st for g_id, g_st in self._ghost_pool.items()
-                    if f_no - g_st.last_seen < GHOST_TIMEOUT * 2
-                }
+                if item is None: # End of stream signal
+                    break
+                
+                f_no, frame = item
 
-            # Draw UI and write frame
-            frame = self._draw_ui(frame, line_x, res, f_no)
-            writer.write(frame)
-            cv2.imshow("Bus Counter", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+                # Progress indicator
+                if f_no % 30 == 0:
+                    q_size = frame_queue.qsize()
+                    print(f"[PROCESSING] Frame {f_no} | Buffer: {q_size} frames ({q_size/FPS:.1f}s delay)")
 
-        cap.release()
-        writer.release()
-        cv2.destroyAllWindows()
+                track_args = dict(
+                    conf    = CONF_THRESH,
+                    iou     = IOU_THRESH,
+                    verbose = False,
+                    tracker = TRACKER_CONFIG,
+                    persist = True,
+                )
+                # VisDrone model uses class 1 (pedestrian); CrowdHuman/standard use class 0
+                if not self.head_detect:
+                    track_args["classes"] = [0]
+
+                res = self.model.track(frame, **track_args)[0]
+                if res.boxes.id is not None:
+                    for b, tid in zip(res.boxes.xyxy.cpu().numpy(),
+                                      res.boxes.id.cpu().numpy().astype(int)):
+                        self._update_track(tid, b, line_x, f_no, frame, FPS)
+
+                # Every 90 frames: move timed-out active tracks into the ghost pool
+                if f_no % 90 == 0:
+                    alive, expired = {}, {}
+                    for t_id, s in self.states.items():
+                        if f_no - s.last_seen < GHOST_TIMEOUT:
+                            alive[t_id] = s
+                        else:
+                            expired[t_id] = s
+                    self.states = alive
+                    self._ghost_pool.update(expired)
+                    self._ghost_pool = {
+                        g_id: g_st for g_id, g_st in self._ghost_pool.items()
+                        if f_no - g_st.last_seen < GHOST_TIMEOUT * 2
+                    }
+
+                # Draw UI and write frame
+                frame = self._draw_ui(frame, line_x, res, f_no)
+                writer.write(frame)
+                
+                # Show frame (can be disabled for headless servers)
+                cv2.imshow("Bus Counter", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    stop_event.set()
+                    break
+
+        finally:
+            stop_event.set()
+            cap.release()
+            writer.release()
+            cv2.destroyAllWindows()
 
         # Save event CSV
         with open(self.output_path.replace(".mp4", ".csv"), "w", newline="") as f:
