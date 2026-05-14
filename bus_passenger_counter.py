@@ -77,7 +77,7 @@ GHOST_BOX_FRAMES = 45      # Synced with track_buffer: keeps box visible as long
 BOX_EMA_ALPHA    = 0.45   # Higher = follows detection more closely; lower = smoother
 
 # ByteTrack tracker config (written at runtime if missing)
-TRACKER_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bytetrack.yaml")
+TRACKER_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botsort.yaml")
 
 # Colours (BGR)
 COL_LINE      = (0,  0,   220)
@@ -553,12 +553,12 @@ class BusCounter:
             # ── Ghost re-link: try to recover a recently-lost track ───
             self._relink_ghost(tid, raw_cx, raw_cy, f_no)
 
-        if tid not in self.states:
-            st = TrackState(kalman=KalmanCentroid(raw_cx, raw_cy), cx=raw_cx, cy=raw_cy, last_seen=f_no)
-            # [REMOVED SKIP] Initialize side immediately even if in the dead zone
-            initial_side = "L" if raw_cx < line_x else "R"
-            st.prev_side = initial_side
-            st.zone_state = "OUTSIDE" if initial_side == "L" else "INSIDE"
+            # [RESTORED STABILITY] Create new track with SKIP logic
+            side = self._get_side(raw_cx, line_x)
+            st   = TrackState(kalman=KalmanCentroid(raw_cx, raw_cy), cx=raw_cx, cy=raw_cy, last_seen=f_no)
+            if side == "L":   st.zone_state, st.prev_side = "OUTSIDE", "L"
+            elif side == "R": st.zone_state, st.prev_side = "INSIDE",  "R"
+            else:             st.zone_state = "SKIP"
             self.states[tid] = st
         st = self.states[tid]
         st.last_seen = f_no
@@ -644,76 +644,68 @@ class BusCounter:
         # # Print exemption status
         # print(f"\n  📊 EXEMPTION STATUS:")
         # print(f"     Current Score: {st.exempt_score:2d}/{EXEMPT_CONFIRM} (max: {EXEMPT_MAX})")
-        # print(f"     Exempt: {'YES ✓' if st.exempt else 'NO ✗'}")
-        # 
-        # if st.exempt and not prev_exempt:
-        #     print(f"\n{'⭐'*40}")
-        #     print(f"  🎉 🎉 🎉 [EXEMPT GRANTED] 🎉 🎉 🎉")
-        #     print(f"  ID {tid} | Score: {st.exempt_score}/{EXEMPT_CONFIRM}")
-        #     print(f"  ⚠️  VERIFY: Is this person wearing radium tape?")
-        #     print(f"{'⭐'*40}\n")
-        # elif not st.exempt and prev_exempt:
-        #     print(f"\n{'⚠️ '*40}")
-        #     print(f"  ⚠️  [EXEMPT REVOKED] ID {tid} (score={st.exempt_score})")
-        #     print(f"{'⚠️ '*40}\n")
-        # 
-        # print(f"{'='*80}\n")
-
         pcx, pcy = st.kalman.update(raw_cx, raw_cy)
         st.cx, st.cy = EMA_ALPHA * raw_cx + (1-EMA_ALPHA) * pcx, EMA_ALPHA * raw_cy + (1-EMA_ALPHA) * pcy
         st.trail.append((int(st.cx), int(st.cy)))
         if st.flash > 0: st.flash -= 1
         
-        # [EXEMPT BYPASS] Commented out early exit so everyone is counted
-        # if st.exempt: return
+        # ── Counting Logic ────────────────────────────────────
+        side = self._get_side(st.cx, line_x)
         
-        # [SKIP LOGIC REMOVED] All tracks are processed immediately
-
-        # ── Counting Logic: Detect Crossings ──────────────────
-        # Use strict line-side for counting to avoid "Dead Zone" misses
-        curr_side = "L" if st.cx < line_x else "R"
-        
-        # Still update zone_state for visuals
-        visual_side = self._get_side(st.cx, line_x)
-        if visual_side == "ZONE":
+        if side == "ZONE":
+            # [HIGH-SPEED OVERRIDE] 
+            # If they jump the line while inside the zone, count them immediately.
+            curr_strict = "L" if st.cx < line_x else "R"
+            if curr_strict != st.prev_side:
+                 self._perform_counting(tid, st, line_x, f_no, fps)
+                 st.prev_side = curr_strict
+            
             st.zone_state = "ZONE"
+            st.side_frames = 0
+            st.debounce_side = ""
         else:
-            st.zone_state = "OUTSIDE" if visual_side == "L" else "INSIDE"
-
-        # Debounce logic remains to prevent jitter, but uses the strict side
-        if st.debounce_side != curr_side:
-            st.debounce_side, st.side_frames = curr_side, 1
-        else:
-            st.side_frames += 1
+            # [STABLE SIDE LOGIC]
+            # Must be outside the zone for DEBOUNCE_N frames to confirm a side change.
+            if st.debounce_side != side:
+                st.debounce_side, st.side_frames = side, 1
+            else:
+                st.side_frames += 1
             
-        if st.side_frames >= DEBOUNCE_N:
-            # Detect transitions across the strict center line
-            crossed_in  = (curr_side == "R" and st.prev_side == "L")
-            crossed_out = (curr_side == "L" and st.prev_side == "R")
+            if st.side_frames >= DEBOUNCE_N:
+                # Normal transition: Zone -> Side
+                self._perform_counting(tid, st, line_x, f_no, fps)
+                st.zone_state = ("OUTSIDE" if side=="L" else "INSIDE")
+                st.prev_side = side
 
-            if crossed_out:
-                if st.counted != "OUT":
-                    self.out_count += 1
-                    st.counted, st.flash = "OUT", FLASH_FRAMES
-                    self.events.append({"frame": f_no, "id": tid, "event": "OUT", "in": self.in_count, "out": self.out_count})
-                    print(f"\n{'🚪'*40}")
-                    print(f"  🚶 PERSON LEFT THE BUS")
-                    print(f"     ID: {tid} | Frame: {f_no:05d} | Time: {f_no/fps:.2f}s")
-                    print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
-                    print(f"{'🚪'*40}\n")
-            elif crossed_in:
-                if st.counted != "IN":
-                    self.in_count += 1
-                    st.counted, st.flash = "IN", FLASH_FRAMES
-                    self.events.append({"frame": f_no, "id": tid, "event": "IN", "in": self.in_count, "out": self.out_count})
-                    print(f"\n{'🚪'*40}")
-                    print(f"  🚶 PERSON ENTERED THE BUS")
-                    print(f"     ID: {tid} | Frame: {f_no:05d} | Time: {f_no/fps:.2f}s")
-                    print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
-                    print(f"{'🚪'*40}\n")
-            
-            # Update state for next frame
-            st.prev_side = curr_side
+    def _perform_counting(self, tid: int, st: TrackState, line_x: int, f_no: int, fps: float):
+        """
+        Core logic to detect side transitions and trigger IN/OUT counts.
+        """
+        # Determine strict side
+        curr_strict = "L" if st.cx < line_x else "R"
+        
+        # Check for crossing
+        crossed_in  = (curr_strict == "R" and st.prev_side == "L")
+        crossed_out = (curr_strict == "L" and st.prev_side == "R")
+
+        if crossed_out:
+            if st.counted != "OUT":
+                self.out_count += 1
+                st.counted, st.flash = "OUT", FLASH_FRAMES
+                self.events.append({"frame": f_no, "id": tid, "event": "OUT", "in": self.in_count, "out": self.out_count})
+                print(f"\n{'🚪'*40}")
+                print(f"  🚶 PERSON LEFT THE BUS (ID {tid})")
+                print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
+                print(f"{'🚪'*40}\n")
+        elif crossed_in:
+            if st.counted != "IN":
+                self.in_count += 1
+                st.counted, st.flash = "IN", FLASH_FRAMES
+                self.events.append({"frame": f_no, "id": tid, "event": "IN", "in": self.in_count, "out": self.out_count})
+                print(f"\n{'🚪'*40}")
+                print(f"  🚶 PERSON ENTERED THE BUS (ID {tid})")
+                print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
+                print(f"{'🚪'*40}\n")
 
     def process(self):
         cap = cv2.VideoCapture(self.video_path)
