@@ -1,0 +1,18 @@
+# Ultralytics BoT-SORT Tracker Configuration (High-Accuracy ReID)
+tracker_type: botsort
+track_high_thresh: 0.25    # min conf for first-stage association
+track_low_thresh:  0.05    # min conf for second-stage association
+new_track_thresh:  0.20    # min conf to initialise a brand-new track
+track_buffer:      45      # frames to keep a lost track alive
+match_thresh:      0.8     # IoU threshold for first-stage match
+fuse_score:        true    # fuse detection score into IoU cost
+
+# BoT-SORT specific settings
+gmc_method: sparseOptFlow   # Handles camera movement/vibration
+proximity_thresh: 0.5      # Spatial proximity threshold
+appearance_thresh: 0.25    # Appearance similarity threshold
+with_reid: true            # Enable visual feature matching
+
+# Premium ReID Model for Top-Down accuracy
+# Using yolov8x-cls for maximum feature extraction power
+model: yolov8x-cls.pt
