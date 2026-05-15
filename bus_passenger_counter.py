@@ -42,6 +42,35 @@ from flask import Flask, Response
 latest_frame = None
 latest_frame_lock = threading.Lock()
 
+app = Flask(__name__)
+
+def gen_frames():
+    """Generator for the MJPEG stream."""
+    global latest_frame
+    while True:
+        with latest_frame_lock:
+            if latest_frame is None:
+                time.sleep(0.01)
+                continue
+            ret, buffer = cv2.imencode('.jpg', latest_frame)
+            frame_bytes = buffer.tobytes()
+
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        time.sleep(0.03)  # ~30 FPS limit for stream
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/health')
+def health():
+    return {"status": "ok", "datetime": datetime.now().isoformat()}
+
+@app.route('/')
+def index():
+    return "<h1>Bus Passenger Counter Live Feed</h1><img src='/video_feed' width='100%'>"
+
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
@@ -1059,6 +1088,11 @@ class BusCounter:
                 frame = self._draw_ui(frame, line_x, res, f_no)
                 writer.write(frame)
 
+                # Update global buffer for MJPEG stream
+                global latest_frame
+                with latest_frame_lock:
+                    latest_frame = frame.copy()
+
                 # Show frame (can be disabled for headless servers)
                 cv2.imshow("Bus Counter", frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -1188,23 +1222,33 @@ if __name__ == "__main__":
     p.add_argument("--debug",      action="store_true",   help="Enable detailed HSV debugging (saves CSV + images)")
     p.add_argument("--head-detect",action="store_true",   help="Use CrowdHuman-trained model for head/partial body detection")
     p.add_argument("--visdrone",   action="store_true",   help="Auto-download and use VisDrone-pretrained YOLOv8n (best for top-down views)")
+    p.add_argument("--port",       type=int,              default=5000,          help="Port for Flask MJPEG server")
+    p.add_argument("--api-endpoint",                      default=API_ENDPOINT,  help="Cloud endpoint for count sync")
     args = p.parse_args()
+
     if args.api_endpoint != API_ENDPOINT:
         API_ENDPOINT = args.api_endpoint
 
-    BusCounter(
+    # Initialize counter
+    counter = BusCounter(
         args.source,
         model_path   = args.model,
         output_path  = args.output,
         enable_debug = args.debug,
         head_detect  = args.head_detect,
         visdrone     = args.visdrone,
-    ).process()
+    )
+
+    # Start AI processing in a background thread
     processing_thread = threading.Thread(target=counter.process, daemon=True)
     processing_thread.start()
+
     print(f"[MAIN] Counter thread started")
     print(f"[MAIN] MJPEG stream available at  http://0.0.0.0:{args.port}/video_feed")
     print(f"[MAIN] Health check available at   http://0.0.0.0:{args.port}/health")
 
     # Run Flask in the main thread (threaded=True handles concurrent viewers)
-    app.run(host="0.0.0.0", port=args.port, threaded=True)
+    try:
+        app.run(host="0.0.0.0", port=args.port, threaded=True)
+    except KeyboardInterrupt:
+        print("[MAIN] Shutting down...")
