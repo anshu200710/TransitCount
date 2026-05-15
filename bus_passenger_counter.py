@@ -32,8 +32,8 @@ import csv, os, argparse
 LINE_RATIO     = 0.45
 DEAD_ZONE_PX   = 30
 DEBOUNCE_N     = 1
-CONF_THRESH    = 0.25    # Balanced: high enough to avoid flickering, low enough to catch persons
-IOU_THRESH     = 0.45    # Lowered: allows tracker to match faster-moving heads
+CONF_THRESH    = 0.10    # Unleashed: lets tracker handle low-conf detections
+IOU_THRESH     = 0.70    # Relaxed: prevents NMS from merging adjacent people
 TRAIL_LEN      = 50
 GHOST_TIMEOUT  = 300     # Raised 150→300: keeps lost tracks alive through occlusions
 FLASH_FRAMES   = 20
@@ -55,8 +55,15 @@ HYSTERESIS_MISS  = 6     # Consecutive non-blurry misses required to revoke exem
 #   had its last known centroid within RELINK_DIST_PX of this new detection.
 #   If so, we re-adopt the ghost instead of creating a new state — this is the
 #   primary fix for "multiple IDs assigned to the same person".
-RELINK_DIST_PX   = 60    # Max centroid distance (px) to consider a ghost match
+RELINK_DIST_PX   = 100   # Max centroid distance (px) to consider a ghost match
 RELINK_MAX_AGE   = 45    # Ghost must have been seen within this many frames
+
+# Cross-side stitching settings
+#   When a NEW track appears on one side and a recently-lost track was on the
+#   OPPOSITE side, infer that the person crossed while undetected and count it.
+#   This catches the scenario where YOLO loses a person during the exact
+#   crossing moment and reassigns a new ID on the other side.
+STITCH_MAX_AGE   = 20    # Max frame gap between disappearance and reappearance
 
 # Blob-first tape detection settings
 #   Instead of measuring the entire ROI, we isolate individual yellow contours
@@ -247,15 +254,11 @@ class BusCounter:
 
         if best_tid is not None:
             adopted = self._ghost_pool.pop(best_tid)
-            # Reset counting state so the new person isn't blocked by the
-            # old ghost's counted/zone flags — this is a DIFFERENT person
-            # who happens to appear near the ghost's last position.
-            adopted.counted       = None
-            adopted.zone_state    = "INIT"
+            # We no longer reset the counting state here.
+            # Preserving prev_side and counted status allows the tracker
+            # to finish a crossing that started before the occlusion.
             adopted.flash         = 0
             adopted.side_frames   = 0
-            adopted.prev_side     = ""
-            adopted.debounce_side = ""
             adopted.trail.clear()
             self.states[new_tid] = adopted
             print(f"  🔗 [RE-LINK] Ghost ID {best_tid} re-adopted as ID {new_tid} "
@@ -264,6 +267,88 @@ class BusCounter:
             return new_tid
 
         return new_tid  # no ghost found — caller creates fresh state
+
+    def _try_cross_stitch(self, new_tid: int, new_side: str, f_no: int, fps: float):
+        """
+        Cross-side stitching: when a new ID appears on one side, check if
+        a recently-lost track was last seen on the OPPOSITE side.  If so,
+        the person likely crossed while undetected — infer the count.
+
+        This catches the scenario where YOLO loses a person during the
+        exact crossing moment and reassigns a new ID on the other side.
+        """
+        if new_side not in ("L", "R"):
+            return
+
+        # A new track on the LEFT means someone may have walked OUT (R→L)
+        # A new track on the RIGHT means someone may have walked IN  (L→R)
+        opposite_zone  = "INSIDE"  if new_side == "L" else "OUTSIDE"
+        expected_event = "OUT"     if new_side == "L" else "IN"
+
+        best_tid = None
+        best_st  = None
+        best_age = float("inf")
+
+        # Search active states for recently-lost tracks on opposite side
+        for oid, ost in self.states.items():
+            if oid == new_tid:
+                continue
+            age = f_no - ost.last_seen
+            if age < 1 or age > STITCH_MAX_AGE:
+                continue
+            if ost.zone_state != opposite_zone:
+                continue
+            if ost.counted == expected_event:
+                continue
+            if age < best_age:
+                best_age = age
+                best_tid = oid
+                best_st  = ost
+
+        # Also search ghost pool
+        for gid, gst in self._ghost_pool.items():
+            age = f_no - gst.last_seen
+            if age < 1 or age > STITCH_MAX_AGE:
+                continue
+            if gst.zone_state != opposite_zone:
+                continue
+            if gst.counted == expected_event:
+                continue
+            if age < best_age:
+                best_age = age
+                best_tid = gid
+                best_st  = gst
+
+        if best_st is None:
+            return
+
+        # Apply the inferred count
+        if expected_event == "OUT":
+            self.out_count += 1
+            best_st.counted = "OUT"
+            self.events.append({"frame": f_no, "id": best_tid, "event": "OUT",
+                                "in": self.in_count, "out": self.out_count})
+            print(f"\n{'🔗'*40}")
+            print(f"  🔗 CROSS-STITCH: ID {best_tid} (INSIDE) → ID {new_tid} (OUTSIDE)")
+            print(f"  🚶 PERSON LEFT THE BUS (stitched, gap={best_age}f)")
+            print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
+            print(f"{'🔗'*40}\n")
+        else:
+            self.in_count += 1
+            best_st.counted = "IN"
+            self.events.append({"frame": f_no, "id": best_tid, "event": "IN",
+                                "in": self.in_count, "out": self.out_count})
+            print(f"\n{'🔗'*40}")
+            print(f"  🔗 CROSS-STITCH: ID {best_tid} (OUTSIDE) → ID {new_tid} (INSIDE)")
+            print(f"  🚶 PERSON ENTERED THE BUS (stitched, gap={best_age}f)")
+            print(f"     📊 Total Count: IN={self.in_count} | OUT={self.out_count}")
+            print(f"{'🔗'*40}\n")
+
+        # Mark the new track as already counted to prevent double-counting
+        # if it later makes a normal crossing
+        new_st = self.states.get(new_tid)
+        if new_st:
+            new_st.counted = expected_event
 
     def _get_side(self, cx: float, line_x: int) -> str:
         if cx < line_x - DEAD_ZONE_PX: return "L"
@@ -553,13 +638,31 @@ class BusCounter:
             # ── Ghost re-link: try to recover a recently-lost track ───
             self._relink_ghost(tid, raw_cx, raw_cy, f_no)
 
-            # [RESTORED STABILITY] Create new track with SKIP logic
-            side = self._get_side(raw_cx, line_x)
-            st   = TrackState(kalman=KalmanCentroid(raw_cx, raw_cy), cx=raw_cx, cy=raw_cy, last_seen=f_no)
-            if side == "L":   st.zone_state, st.prev_side = "OUTSIDE", "L"
-            elif side == "R": st.zone_state, st.prev_side = "INSIDE",  "R"
-            else:             st.zone_state = "SKIP"
-            self.states[tid] = st
+            if tid not in self.states:
+                # No ghost was re-adopted — create fresh state
+                side = self._get_side(raw_cx, line_x)
+                st   = TrackState(kalman=KalmanCentroid(raw_cx, raw_cy), cx=raw_cx, cy=raw_cy, last_seen=f_no)
+                if side == "L":   st.zone_state, st.prev_side = "OUTSIDE", "L"
+                elif side == "R": st.zone_state, st.prev_side = "INSIDE",  "R"
+                else:
+                    # First seen in dead zone — infer approach side from position
+                    # relative to the trigger line so they can still be counted
+                    st.zone_state = "ZONE"
+                    st.prev_side = "L" if raw_cx < line_x else "R"
+                self.states[tid] = st
+                # ── Cross-side stitch: infer crossing from fragmented IDs ──
+                if side in ("L", "R"):
+                    self._try_cross_stitch(tid, side, f_no, fps)
+            else:
+                # Ghost was re-adopted — only initialise approach side if history is empty
+                adopted = self.states[tid]
+                if not adopted.prev_side:
+                    side = self._get_side(raw_cx, line_x)
+                    if side == "L":    adopted.zone_state, adopted.prev_side = "OUTSIDE", "L"
+                    elif side == "R":  adopted.zone_state, adopted.prev_side = "INSIDE",  "R"
+                    else:
+                        adopted.zone_state = "ZONE"
+                        adopted.prev_side = "L" if raw_cx < line_x else "R"
         st = self.states[tid]
         st.last_seen = f_no
 
@@ -656,7 +759,7 @@ class BusCounter:
             # [HIGH-SPEED OVERRIDE] 
             # If they jump the line while inside the zone, count them immediately.
             curr_strict = "L" if st.cx < line_x else "R"
-            if curr_strict != st.prev_side:
+            if st.prev_side and curr_strict != st.prev_side:
                  self._perform_counting(tid, st, line_x, f_no, fps)
                  st.prev_side = curr_strict
             
@@ -765,6 +868,7 @@ class BusCounter:
                     verbose = False,
                     tracker = TRACKER_CONFIG,
                     persist = True,
+                    agnostic_nms = True,
                 )
                 # VisDrone model uses class 1 (pedestrian); CrowdHuman/standard use class 0
                 if not self.head_detect:
