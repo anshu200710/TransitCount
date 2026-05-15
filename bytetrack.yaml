@@ -1,7 +1,7 @@
 tracker_type: bytetrack
-track_high_thresh: 0.25    # min conf for first-stage association
-track_low_thresh:  0.05    # min conf for second-stage (tentative) association
-new_track_thresh:  0.20    # min conf to initialise a brand-new track
-track_buffer:      45      # frames to keep a lost track alive (~1.5 s @ 30 fps)
-match_thresh:      0.85    # IoU threshold for first-stage match (higher = more lenient)
-fuse_score:        true    # fuse detection score into IoU cost
+track_high_thresh: 0.20
+track_low_thresh:  0.05
+new_track_thresh:  0.15
+track_buffer:      50
+match_thresh:      0.85
+fuse_score:        true

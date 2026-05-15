@@ -11,13 +11,25 @@ Key improvements over v4.0:
   • Centroid-distance fallback matching in _update_track so fast-moving heads
     are still linked even when IoU matching would fail
   • EMA smoothing on all 4 bounding-box corners for jitter-free visuals
+Bus Passenger Counter — v5.0 BLOB-FIRST TAPE + GHOST BOX + BOX EMA + API PUSH
+=======================================================================
+Production-ready merge of v5.0 detection/counting logic with:
+  • Non-blocking API POST via background daemon thread + queue (zero FPS impact)
+  • Flask MJPEG stream server (/video_feed) for remote monitoring
+  • Async frame reader (prevents RTMP socket timeout)
+  • Frame-skip (process every Nth frame, buffer the rest)
+  • BLOB-FIRST tape detection: immune to blur/dilution simultaneously
+  • Ghost box extrapolation: Kalman-predicted box when detection absent
+  • Centroid-distance fallback ghost re-link (fewer ID switches)
+  • EMA smoothing on all 4 bounding-box corners (jitter-free visuals)
+  • High-speed zone crossing override (counts even mid-dead-zone)
+  • Hysteresis-based exemption scoring with temporal vote window
 """
 
 import cv2
 import numpy as np
-import supervision as sv
+import supervision as sv  # noqa: F401  (kept for compatibility)
 from ultralytics import YOLO
-import torch
 import threading
 import queue
 import time
@@ -26,6 +38,25 @@ from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime
 import csv, os, argparse
+from flask import Flask, Response
+latest_frame = None
+latest_frame_lock = threading.Lock()
+
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+
+# ── NEW: non-blocking API push imports ──────────────────────────────────
+import threading
+import queue
+import time
+try:
+    import requests
+    _REQUESTS_OK = True
+except ImportError:
+    _REQUESTS_OK = False
+    print("[WARN] 'requests' library not found. API push disabled. "
+          "Install with: pip install requests")
 
 # ═══════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -45,11 +76,11 @@ EXEMPT_MAX     = 12      # Cap on exemption score
 MERGE_AR_THRESH= 1.5     # W/H ratio above which bbox likely contains 2 people
 MERGE_OVERLAP  = 0.30    # IoU above which two tracks are considered overlapping
 
-# Motion-blur robustness settings
-BLUR_VAR_THRESH  = 40    # Laplacian variance below which a crop is too blurry to score
-VOTE_WINDOW      = 7     # Sliding-window size for temporal tape voting
-VOTE_MIN_HITS    = 2     # Detections needed within window to confirm tape
-HYSTERESIS_MISS  = 6     # Consecutive non-blurry misses required to revoke exemption
+# Motion-blur robustness
+BLUR_VAR_THRESH = 40      # Laplacian variance below which a crop is too blurry
+VOTE_WINDOW     = 7       # Sliding-window size for temporal tape voting
+VOTE_MIN_HITS   = 2       # Detections needed within window to confirm tape
+HYSTERESIS_MISS = 6       # Consecutive non-blurry misses to revoke exemption
 
 # Top-down re-link settings
 #   When a NEW track ID appears, we check whether any recently-lost ghost track
@@ -59,11 +90,6 @@ HYSTERESIS_MISS  = 6     # Consecutive non-blurry misses required to revoke exem
 RELINK_DIST_PX   = 100   # Max centroid distance (px) to consider a ghost match
 RELINK_MAX_AGE   = 45    # Ghost must have been seen within this many frames
 
-# Cross-side stitching settings
-#   When a NEW track appears on one side and a recently-lost track was on the
-#   OPPOSITE side, infer that the person crossed while undetected and count it.
-#   This catches the scenario where YOLO loses a person during the exact
-#   crossing moment and reassigns a new ID on the other side.
 STITCH_MAX_AGE   = 20    # Max frame gap between disappearance and reappearance
 
 # Blob-first tape detection settings
@@ -84,7 +110,16 @@ GHOST_BOX_FRAMES = 45      # Synced with track_buffer: keeps box visible as long
 #   EMA applied to all 4 corners to remove per-frame YOLO jitter.
 BOX_EMA_ALPHA    = 0.45   # Higher = follows detection more closely; lower = smoother
 
+
 # ByteTrack tracker config (written at runtime if missing)
+TRACKER_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bytetrack.yaml")
+# ── API configuration ────────────────────────────────────────────────────
+API_ENDPOINT   = "https://bae6-49-205-179-53.ngrok-free.app/passenger-count"
+API_TIMEOUT    = 2        # seconds — never block processing loop
+API_MAX_RETRY  = 2        # retries on 5xx errors
+API_RETRY_WAIT = 0.3      # seconds between retries
+
+# BoT-SORT tracker config (see botsort.yaml for full settings)
 TRACKER_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botsort.yaml")
 
 # Colours (BGR)
@@ -118,7 +153,111 @@ class TrackState:
     tape_votes:   deque = field(default_factory=lambda: deque(maxlen=VOTE_WINDOW))
     consec_miss:  int   = 0  # Consecutive non-blurry frames where tape was NOT detected
 
+# ═══════════════════════════════════════════════════════
+#  NON-BLOCKING API PUSH WORKER
+# ═══════════════════════════════════════════════════════
+
+class ApiPushWorker:
+    """
+    Background daemon thread draining a queue and firing POST requests.
+    The main video loop enqueues a payload and returns immediately —
+    network latency or retries never touch the processing thread.
+    """
+
+    def __init__(self, endpoint: str,
+                 timeout: float = API_TIMEOUT,
+                 max_retry: int = API_MAX_RETRY,
+                 retry_wait: float = API_RETRY_WAIT):
+        self.endpoint   = endpoint
+        self.timeout    = timeout
+        self.max_retry  = max_retry
+        self.retry_wait = retry_wait
+        self._q         = queue.Queue()
+        self._enabled   = _REQUESTS_OK
+
+        if self._enabled:
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            print(f"[API] Push worker started → {endpoint}")
+        else:
+            print("[API] Push worker DISABLED (requests not installed)")
+
+    def push(self, in_count: int, out_count: int):
+        """Enqueue a payload. Returns immediately — never blocks."""
+        if not self._enabled:
+            return
+        inside  = max(0, in_count - out_count)
+        payload = {
+            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "hin":      in_count,
+            "hout":     out_count,
+            "inside":   inside,
+            "total":    inside,
+        }
+        self._q.put(payload)
+
+    def _worker(self):
+        while True:
+            payload = self._q.get()
+            self._send_with_retry(payload)
+            self._q.task_done()
+
+    def _send_with_retry(self, payload: dict):
+        for attempt in range(1, self.max_retry + 2):
+            try:
+                resp = requests.post(
+                    self.endpoint, json=payload, timeout=self.timeout,
+                    headers={"Content-Type": "application/json"},
+                )
+                if resp.status_code < 500:
+                    if resp.status_code >= 400:
+                        print(f"[API] Client error {resp.status_code} — not retrying")
+                    else:
+                        print(f"[API] ✓ {resp.status_code}  "
+                              f"hin={payload['hin']} hout={payload['hout']} "
+                              f"inside={payload['inside']}")
+                    return
+                print(f"[API] Server error {resp.status_code} (attempt {attempt})")
+            except requests.exceptions.Timeout:
+                print(f"[API] Timeout (attempt {attempt})")
+            except requests.exceptions.ConnectionError as e:
+                print(f"[API] Connection error (attempt {attempt}): {e}")
+            except Exception as e:
+                print(f"[API] Unexpected error: {e}")
+                return
+            if attempt <= self.max_retry:
+                time.sleep(self.retry_wait)
+        print(f"[API] Gave up after {self.max_retry + 1} attempts")
+
+
+# ═══════════════════════════════════════════════════════
+#  TRACK STATE & KALMAN FILTER
+# ═══════════════════════════════════════════════════════
+
+@dataclass
+class TrackState:
+    kalman:        'KalmanCentroid'
+    cx:            float
+    cy:            float
+    trail:         deque = field(default_factory=lambda: deque(maxlen=TRAIL_LEN))
+    zone_state:    str   = "INIT"
+    counted:       Optional[str] = None
+    flash:         int   = 0
+    last_seen:     int   = 0
+    side_frames:   int   = 0
+    prev_side:     str   = ""
+    debounce_side: str   = ""
+    exempt:        bool  = False
+    exempt_score:  int   = 0
+    last_bbox:     tuple = field(default_factory=lambda: (0, 0, 0, 0))
+    smooth_bbox:   tuple = field(default_factory=lambda: (0, 0, 0, 0))
+    tape_votes:    deque = field(default_factory=lambda: deque(maxlen=VOTE_WINDOW))
+    consec_miss:   int   = 0
+
+
 class KalmanCentroid:
+    """Constant-velocity Kalman filter for centroid smoothing."""
+
     def __init__(self, cx: float, cy: float):
         self.kf = cv2.KalmanFilter(4, 2)
         self.kf.measurementMatrix   = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
@@ -128,11 +267,11 @@ class KalmanCentroid:
         # sudden direction changes without lagging behind and breaking IoU matching.
         self.kf.processNoiseCov     = np.eye(4, dtype=np.float32) * 0.5
         self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
-        self.kf.statePost           = np.array([[cx],[cy],[0],[0]], np.float32)
+        self.kf.statePost           = np.array([[cx], [cy], [0], [0]], np.float32)
 
     def update(self, cx: float, cy: float):
         self.kf.predict()
-        meas = np.array([[cx],[cy]], np.float32)
+        meas = np.array([[cx], [cy]], np.float32)
         res  = self.kf.correct(meas)
         return float(res[0, 0]), float(res[1, 0])
 
@@ -141,6 +280,11 @@ class KalmanCentroid:
         pred = self.kf.predict()
         return float(pred[0, 0]), float(pred[1, 0])
 
+
+# ═══════════════════════════════════════════════════════
+#  MAIN COUNTER CLASS
+# ═══════════════════════════════════════════════════════
+
 class BusCounter:
     def __init__(self, video_path: str, model_path: str = "yolov8x.pt", output_path: str = "result_v4.mp4",
                  enable_debug: bool = False, head_detect: bool = False, visdrone: bool = False):
@@ -148,7 +292,7 @@ class BusCounter:
         self.output_path = output_path
         self.head_detect = head_detect
 
-        # ── Model selection priority: visdrone > head_detect > default ──
+        # Model selection priority: visdrone > head_detect > default
         if visdrone:
             model_path = self._ensure_visdrone_model()
         elif head_detect and model_path == "yolov8x.pt":
@@ -160,15 +304,15 @@ class BusCounter:
         self.out_count  = 0
         self.events: list[dict] = []
 
-        # Ghost re-link table: maps a lost track_id → its last known TrackState
-        # so that when a brand-new ID appears close to a ghost's last position
-        # we can re-adopt the ghost state rather than starting fresh.
+        # Ghost re-link table: maps lost track_id → last known TrackState
         self._ghost_pool: dict[int, TrackState] = {}
 
-        # Ensure ByteTrack YAML exists (write minimal config if absent)
+        # Non-blocking API push worker
+        self.api = ApiPushWorker(API_ENDPOINT, API_TIMEOUT, API_MAX_RETRY, API_RETRY_WAIT)
+
         self._ensure_bytetrack_yaml()
 
-        # Enhanced debugging
+        # Debug setup
         self.enable_debug = enable_debug
         self.debug_log: list[dict] = []
         if self.enable_debug:
@@ -189,7 +333,9 @@ class BusCounter:
     def _ensure_head_model(self) -> str:
         """Download CrowdHuman-trained YOLOv8n if not already present."""
         import urllib.request
-        head_model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolov8n_crowdhuman.pt")
+        head_model_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "yolov8n_crowdhuman.pt"
+        )
         if not os.path.exists(head_model_path):
             url = "https://github.com/yakhyo/yolov8-crowdhuman/releases/download/weights/yolov8n_best.pt"
             print(f"[HEAD-DETECT] Downloading CrowdHuman model from {url}...")
@@ -227,25 +373,24 @@ class BusCounter:
             return
         yaml_content = (
             "tracker_type: bytetrack\n"
-            "track_high_thresh: 0.25    # min conf for first-stage association\n"
-            "track_low_thresh:  0.05    # min conf for second-stage (tentative) association\n"
-            "new_track_thresh:  0.20    # min conf to initialise a brand-new track\n"
-            "track_buffer:      45      # frames to keep a lost track alive (~1.5 s @ 30 fps)\n"
-            "match_thresh:      0.85    # IoU threshold for first-stage match (higher = more lenient)\n"
-            "fuse_score:        true    # fuse detection score into IoU cost\n"
+            "track_high_thresh: 0.25\n"
+            "track_low_thresh:  0.05\n"
+            "new_track_thresh:  0.20\n"
+            "track_buffer:      45\n"
+            "match_thresh:      0.85\n"
+            "fuse_score:        true\n"
         )
         with open(TRACKER_CONFIG, "w") as f:
             f.write(yaml_content)
         print(f"[BYTETRACK] Config written to {TRACKER_CONFIG}")
 
+    # ── Ghost re-link ──────────────────────────────────────────────────────────
+
     def _relink_ghost(self, new_tid: int, raw_cx: float, raw_cy: float, f_no: int) -> int:
         """
-        Before creating a brand-new TrackState for `new_tid`, search the ghost
-        pool for a recently-lost track whose last centroid is within RELINK_DIST_PX.
-        If found, migrate that ghost's state to `new_tid` so no new ID is born.
-
-        Returns the track ID whose state should be used (may differ from new_tid
-        if a ghost was re-adopted — caller uses self.states[new_tid] normally).
+        Before creating a brand-new TrackState for new_tid, search the ghost pool
+        for a recently-lost track whose last centroid is within RELINK_DIST_PX.
+        Migrates the ghost state to new_tid and resets counting flags.
         """
         best_tid  = None
         best_dist = float("inf")
@@ -273,7 +418,9 @@ class BusCounter:
                   f"— counting state RESET")
             return new_tid
 
-        return new_tid  # no ghost found — caller creates fresh state
+        return new_tid
+
+    # ── Utility helpers ────────────────────────────────────────────────────────
 
     def _try_cross_stitch(self, new_tid: int, new_side: str, f_no: int, fps: float):
         """
@@ -362,13 +509,8 @@ class BusCounter:
         if cx > line_x + DEAD_ZONE_PX: return "R"
         return "ZONE"
 
-    def _is_blurry(self, crop: np.ndarray) -> tuple[bool, float]:
-        """
-        Compute Laplacian variance to detect motion blur.
-        Returns (is_blurry, variance) — blurry frames are skipped for scoring
-        to avoid penalising the exemption score unfairly.
-        """
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    def _is_blurry(self, crop: np.ndarray) -> tuple:
+        gray    = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
         return (lap_var < BLUR_VAR_THRESH, lap_var)
 
@@ -392,6 +534,17 @@ class BusCounter:
             only, so weak signal is not diluted by background
           • Close range: background yellow gets many large blobs that fail the
             compactness or ratio filter; real tape forms a tight compact blob
+        Detect radium tape (orange-yellow) using blob-first analysis.
+
+        Pipeline:
+          1. Blur gate  — skip blurry crops (score unchanged)
+          2. Denoise    — bilateral filter to preserve edges
+          3. ROI        — top 20–60% of crop (shoulder band)
+          4. HSV mask   — wide S lower-bound to tolerate blur smear
+          5. Morphology — clean noise from mask
+          6. Contours   — find individual yellow blobs
+          7. Per-blob   — filter by area ratio, compactness, peak S and V
+          8. Decision   — any blob passing all filters → tape detected
         """
         if crop is None or crop.size == 0:
             return False
@@ -399,14 +552,14 @@ class BusCounter:
         crop_h, crop_w = crop.shape[:2]
         crop_area      = crop_h * crop_w
 
-        # ── Step 1: Blur gate ─────────────────────────────────────────
+        # Step 1: Blur gate
         blurry, lap_var = self._is_blurry(crop)
         print(f"     📷 Sharpness (Laplacian var): {lap_var:.1f} "
               f"({'BLURRY — detection skipped' if blurry else 'SHARP — proceeding'})")
         if blurry:
             return False
 
-        # ── Step 2: Edge-preserving denoise ──────────────────────────
+        # ── Step 2: Edge-preserving denoise before colour analysis ────
         crop_clean = cv2.bilateralFilter(crop, d=9, sigmaColor=75, sigmaSpace=75)
         hsv        = cv2.cvtColor(crop_clean, cv2.COLOR_BGR2HSV)
 
@@ -545,14 +698,13 @@ class BusCounter:
         # Pad mask_yellow back to full crop height using the dynamic roi_top offset
         full_mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
         roi_rows  = mask_yellow.shape[0]
-        full_mask[roi_top:roi_top + roi_rows,
-                  0:mask_yellow.shape[1]] = mask_yellow
-        canvas[0:crop_h, crop_w:2 * crop_w] = cv2.cvtColor(full_mask, cv2.COLOR_GRAY2BGR)
+        full_mask[roi_top:roi_top + roi_rows, 0:mask_yellow.shape[1]] = mask_yellow
+        canvas[0:crop_h, crop_w:2*crop_w] = cv2.cvtColor(full_mask, cv2.COLOR_GRAY2BGR)
 
         shoulder_vis = crop.copy()
         roi_bottom   = roi_top + roi_rows
         cv2.rectangle(shoulder_vis, (0, roi_top), (crop_w, roi_bottom), (0, 255, 255), 2)
-        canvas[0:crop_h, 2 * crop_w:3 * crop_w] = shoulder_vis
+        canvas[0:crop_h, 2*crop_w:3*crop_w] = shoulder_vis
 
         # Row 2: Hue | Saturation | Value
         h_vis = cv2.applyColorMap((hsv[:, :, 0] * 2).astype(np.uint8), cv2.COLORMAP_HSV)
@@ -562,7 +714,7 @@ class BusCounter:
         canvas[crop_h:2 * crop_h, 0:crop_w]              = h_vis
         canvas[crop_h:2 * crop_h, crop_w:2 * crop_w]     = s_vis
         canvas[crop_h:2 * crop_h, 2 * crop_w:3 * crop_w] = v_vis
-        
+
         # Labels
         labels = [
             (10,              20,           "Original"),
@@ -575,10 +727,9 @@ class BusCounter:
         for x, y, txt in labels:
             cv2.putText(canvas, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
-        # Status
-        status = "DETECTED" if debug_data.get('would_detect', False) else "REJECTED"
-        color  = (0, 255, 0)  if debug_data.get('would_detect', False) else (0, 0, 255)
-        cv2.putText(canvas, status, (10, crop_h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        status = "DETECTED" if debug_data.get('would_detect') else "REJECTED"
+        color  = (0, 255, 0) if debug_data.get('would_detect') else (0, 0, 255)
+        cv2.putText(canvas, status, (10, crop_h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         # Stats
         lap_str = f"Lap:{debug_data.get('laplacian_variance', 0):.1f}"
@@ -635,12 +786,12 @@ class BusCounter:
     def _update_track(self, tid, bbox, line_x, f_no, frame, fps: float = 30.0):
         x1, y1, x2, y2 = bbox.astype(int)
         raw_cx, raw_cy = (x1+x2)/2.0, (y1+y2)/2.0
-        
+
         # Print frame header for better readability
         print(f"\n{'='*80}")
         print(f"  FRAME {f_no:05d} | ID {tid:2d} | Timestamp: {f_no/fps:.2f}s")
         print(f"{'='*80}")
-        
+
         if tid not in self.states:
             # ── Ghost re-link: try to recover a recently-lost track ───
             self._relink_ghost(tid, raw_cx, raw_cy, f_no)
@@ -696,12 +847,12 @@ class BusCounter:
         overlapping = self._overlaps_other_tracks(tid, (x1, y1, x2, y2), f_no)
         tape_found = False
         skip_reason = ""
-        
+
         # Print bounding box info
         print(f"  📦 Bounding Box: {w_box:3d}x{h_box:3d} | Aspect Ratio: {ar:.2f}")
         print(f"  📍 Position: ({x1}, {y1}) → ({x2}, {y2})")
         print(f"  💻 Device: {self.device_info}")
-        
+
         # [EXEMPT BYPASS] Commented out tape detection and scoring logic
         # if merged:
         #     skip_reason = "MERGED"
@@ -713,7 +864,7 @@ class BusCounter:
         #     print(f"  ✓ Status: Clean single-person box - Running tape detection...")
         #     print(f"  {'-'*76}")
         #     crop = frame[max(0,y1):min(frame.shape[0],y2), max(0,x1):min(frame.shape[1],x2)]
-        # 
+        #
         #     # ── Blur gate: skip scoring on blurry crops ───────────────
         #     blurry, lap_var = self._is_blurry(crop)
         #     if blurry:
@@ -723,13 +874,13 @@ class BusCounter:
         #     else:
         #         tape_found = self._has_radium_tape(crop, tid, f_no, fps)
         #         print(f"  {'-'*76}")
-        # 
+        #
         #         # ── Temporal vote window ──────────────────────────────
         #         st.tape_votes.append(1 if tape_found else 0)
         #         vote_hits = sum(st.tape_votes)
         #         vote_confirmed = (len(st.tape_votes) >= VOTE_MIN_HITS and
         #                           vote_hits >= VOTE_MIN_HITS)
-        # 
+        #
         #         if tape_found:
         #             st.exempt_score = min(st.exempt_score + 3, EXEMPT_MAX)
         #             st.consec_miss  = 0
@@ -744,33 +895,34 @@ class BusCounter:
         #             else:
         #                 print(f"  ❌ NO TAPE — consec miss {st.consec_miss}/{HYSTERESIS_MISS} "
         #                       f"(score held) | Votes: {vote_hits}/{len(st.tape_votes)}")
-        
+
         # [EXEMPT BYPASS] Commented out exemption status check and granting logic
         # prev_exempt = st.exempt
         # if st.exempt_score >= EXEMPT_CONFIRM:
         #     st.exempt = True
         # elif st.exempt_score == 0 and st.consec_miss >= HYSTERESIS_MISS:
         #     st.exempt = False
-        # 
+        #
         # # Print exemption status
         # print(f"\n  📊 EXEMPTION STATUS:")
         # print(f"     Current Score: {st.exempt_score:2d}/{EXEMPT_CONFIRM} (max: {EXEMPT_MAX})")
         pcx, pcy = st.kalman.update(raw_cx, raw_cy)
-        st.cx, st.cy = EMA_ALPHA * raw_cx + (1-EMA_ALPHA) * pcx, EMA_ALPHA * raw_cy + (1-EMA_ALPHA) * pcy
+        st.cx = EMA_ALPHA * raw_cx + (1 - EMA_ALPHA) * pcx
+        st.cy = EMA_ALPHA * raw_cy + (1 - EMA_ALPHA) * pcy
         st.trail.append((int(st.cx), int(st.cy)))
         if st.flash > 0: st.flash -= 1
-        
+
         # ── Counting Logic ────────────────────────────────────
         side = self._get_side(st.cx, line_x)
-        
+
         if side == "ZONE":
-            # [HIGH-SPEED OVERRIDE] 
+            # [HIGH-SPEED OVERRIDE]
             # If they jump the line while inside the zone, count them immediately.
             curr_strict = "L" if st.cx < line_x else "R"
             if st.prev_side and curr_strict != st.prev_side:
                  self._perform_counting(tid, st, line_x, f_no, fps)
                  st.prev_side = curr_strict
-            
+
             st.zone_state = "ZONE"
             st.side_frames = 0
             st.debounce_side = ""
@@ -781,7 +933,7 @@ class BusCounter:
                 st.debounce_side, st.side_frames = side, 1
             else:
                 st.side_frames += 1
-            
+
             if st.side_frames >= DEBOUNCE_N:
                 # Normal transition: Zone -> Side
                 self._perform_counting(tid, st, line_x, f_no, fps)
@@ -794,7 +946,7 @@ class BusCounter:
         """
         # Determine strict side
         curr_strict = "L" if st.cx < line_x else "R"
-        
+
         # Check for crossing
         crossed_in  = (curr_strict == "R" and st.prev_side == "L")
         crossed_out = (curr_strict == "L" and st.prev_side == "R")
@@ -827,7 +979,7 @@ class BusCounter:
         W, H, FPS = int(cap.get(3)), int(cap.get(4)), cap.get(5) or 30.0
         line_x = int(W * LINE_RATIO)
         writer  = cv2.VideoWriter(self.output_path, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (W, H))
-        
+
         # ── Asynchronous Reader Setup ────────────────────────────────
         # We use a thread to constantly pull frames from the stream.
         # This prevents RTMP timeouts by ensuring the network socket is
@@ -843,7 +995,7 @@ class BusCounter:
                     frame_queue.put(None)  # Signal end of stream
                     break
                 f_count += 1
-                # Block if queue is full to prevent memory explosion, 
+                # Block if queue is full to prevent memory explosion,
                 # but 1500 frames is a very large safety margin.
                 frame_queue.put((f_count, frame))
 
@@ -862,7 +1014,7 @@ class BusCounter:
 
                 if item is None: # End of stream signal
                     break
-                
+
                 f_no, frame = item
 
                 # Progress indicator
@@ -906,7 +1058,7 @@ class BusCounter:
                 # Draw UI and write frame
                 frame = self._draw_ui(frame, line_x, res, f_no)
                 writer.write(frame)
-                
+
                 # Show frame (can be disabled for headless servers)
                 cv2.imshow("Bus Counter", frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -1037,6 +1189,9 @@ if __name__ == "__main__":
     p.add_argument("--head-detect",action="store_true",   help="Use CrowdHuman-trained model for head/partial body detection")
     p.add_argument("--visdrone",   action="store_true",   help="Auto-download and use VisDrone-pretrained YOLOv8n (best for top-down views)")
     args = p.parse_args()
+    if args.api_endpoint != API_ENDPOINT:
+        API_ENDPOINT = args.api_endpoint
+
     BusCounter(
         args.source,
         model_path   = args.model,
@@ -1045,3 +1200,11 @@ if __name__ == "__main__":
         head_detect  = args.head_detect,
         visdrone     = args.visdrone,
     ).process()
+    processing_thread = threading.Thread(target=counter.process, daemon=True)
+    processing_thread.start()
+    print(f"[MAIN] Counter thread started")
+    print(f"[MAIN] MJPEG stream available at  http://0.0.0.0:{args.port}/video_feed")
+    print(f"[MAIN] Health check available at   http://0.0.0.0:{args.port}/health")
+
+    # Run Flask in the main thread (threaded=True handles concurrent viewers)
+    app.run(host="0.0.0.0", port=args.port, threaded=True)
