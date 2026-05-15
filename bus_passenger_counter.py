@@ -17,6 +17,7 @@ import cv2
 import numpy as np
 import supervision as sv
 from ultralytics import YOLO
+import torch
 import threading
 import queue
 import time
@@ -178,6 +179,12 @@ class BusCounter:
             os.makedirs(self.debug_crops_dir,    exist_ok=True)
             os.makedirs(self.debug_analysis_dir, exist_ok=True)
             print(f"[DEBUG MODE] Enabled - Output: {self.debug_dir}/")
+
+        # Determine device info once for logging
+        if torch.cuda.is_available():
+            self.device_info = f"GPU: {torch.cuda.get_device_name(0)}"
+        else:
+            self.device_info = "CPU"
 
     def _ensure_head_model(self) -> str:
         """Download CrowdHuman-trained YOLOv8n if not already present."""
@@ -693,6 +700,7 @@ class BusCounter:
         # Print bounding box info
         print(f"  📦 Bounding Box: {w_box:3d}x{h_box:3d} | Aspect Ratio: {ar:.2f}")
         print(f"  📍 Position: ({x1}, {y1}) → ({x2}, {y2})")
+        print(f"  💻 Device: {self.device_info}")
         
         # [EXEMPT BYPASS] Commented out tape detection and scoring logic
         # if merged:
